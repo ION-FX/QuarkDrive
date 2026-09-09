@@ -174,6 +174,7 @@ crates/
 web/                 the browser UI (plain HTML/CSS/JS, no build step)
   themes.js          the built-in palettes and the code that applies them
   test-themes.js     tests for the above, run with `node`
+  test-app.js        executes app.js in a stub DOM: sign-in, sign-up flows
 desktop/             PyQt6 desktop GUI: files, photos, drag-and-drop upload
   qd-gui.py          the app
   test-gui.py        offscreen integration test against a live server
@@ -191,11 +192,15 @@ cargo test
 justifies content-defined chunking), the crypto, the object store's tamper
 detection, the merge rules, and full two-device sync scenarios.
 
-The web UI's theming logic has its own dependency-free tests, run directly
-with node:
+The web UI has dependency-free tests that run directly with node:
+`test-themes.js` covers the theming logic and the login/sign-up wiring,
+and `test-app.js` executes the real `app.js` inside a stub DOM — boot,
+sign-in, first-run sign-up, validation, and the stale-page case where a
+cached older markup meets a newer script:
 
 ```sh
 node web/test-themes.js
+node web/test-app.js
 ```
 
 For an end-to-end run against a real server, see `scripts/e2e.sh`.

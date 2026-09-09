@@ -168,16 +168,24 @@ function showApp() {
  * registration and these fields stay out of the way. */
 
 function showSignup() {
-  $('#signin-fields').hidden = true;
-  $('#signup-fields').hidden = false;
+  // Guarded lookups: a browser running this newer script against a cached
+  // older page (or vice versa) must still be able to sign in.
+  const fields = document.getElementById('signup-fields');
+  const signin = document.getElementById('signin-fields');
+  if (!fields || !signin) return;
+  fields.hidden = false;
+  signin.hidden = true;
   $('#signup-server').value = $('#login-server').value.trim() || window.location.origin;
   $('#signup-vault').placeholder = $('#signup-username').value.trim() || 'photos';
   $('#login-error').hidden = true;
 }
 
 function showSignin() {
-  $('#signup-fields').hidden = true;
-  $('#signin-fields').hidden = false;
+  const fields = document.getElementById('signup-fields');
+  const signin = document.getElementById('signin-fields');
+  if (!fields || !signin) return;
+  fields.hidden = true;
+  signin.hidden = false;
   $('#login-error').hidden = true;
 }
 
@@ -1114,7 +1122,8 @@ function init() {
         ? 'Could not reach the server. Check the address, and that the server is running and reachable from this browser.'
         : null;
 
-    if (!$('#signup-fields').hidden) {
+    const signupFields = document.getElementById('signup-fields');
+    if (signupFields && !signupFields.hidden) {
       const server = $('#signup-server').value.trim();
       const username = $('#signup-username').value.trim();
       const password = $('#signup-password').value;
@@ -1154,17 +1163,22 @@ function init() {
     }
   });
 
-  $('#to-signup').addEventListener('click', (ev) => {
-    ev.preventDefault();
-    showSignup();
-  });
-  $('#to-signin').addEventListener('click', (ev) => {
-    ev.preventDefault();
-    showSignin();
-  });
-  $('#signup-username').addEventListener('input', () => {
-    $('#signup-vault').placeholder = $('#signup-username').value.trim() || 'photos';
-  });
+  // The sign-up controls only exist on pages served after this feature;
+  // a cached older page must not break the listeners below.
+  const toSignup = $('#to-signup');
+  if (toSignup) {
+    toSignup.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      showSignup();
+    });
+    $('#to-signin').addEventListener('click', (ev) => {
+      ev.preventDefault();
+      showSignin();
+    });
+    $('#signup-username').addEventListener('input', () => {
+      $('#signup-vault').placeholder = $('#signup-username').value.trim() || 'photos';
+    });
+  }
 
   $('#logout').addEventListener('click', signOut);
 

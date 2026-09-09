@@ -9,7 +9,7 @@ description = "Quarkdrive sync and file server"
 quarkdrive-core = { path = "../quarkdrive-core" }
 
 axum = "0.7"
-tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
+tower-http = { version = "0.5", features = ["fs", "cors", "trace", "set-header"] }
 tokio = { version = "1.35", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 

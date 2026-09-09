@@ -18,11 +18,14 @@ mod media;
 mod vault;
 
 use anyhow::{Context, Result};
+use axum::http::header::CACHE_CONTROL;
+use axum::http::HeaderValue;
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeaderLayer;
 
 #[derive(Parser)]
 #[command(name = "quarkdrive-server", about = "Quarkdrive sync and file server")]
@@ -174,8 +177,15 @@ async fn serve(listen: SocketAddr, data: &Path, web: Option<&Path>) -> Result<()
 
     let web_dir = resolve_web_dir(web);
     let index = web_dir.join("index.html");
-    let app =
-        api::router(state).fallback_service(ServeDir::new(&web_dir).fallback(ServeFile::new(index)));
+    // no-cache (revalidate before reuse, not "never store"): without it a
+    // browser may heuristically serve a stale index.html against a newer
+    // app.js, and mixed UI versions fail silently.
+    let app = api::router(state)
+        .fallback_service(ServeDir::new(&web_dir).fallback(ServeFile::new(index)))
+        .layer(SetResponseHeaderLayer::overriding(
+            CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        ));
 
     tracing::info!("listening on http://{listen}");
     tracing::info!("data directory: {}", data.display());
