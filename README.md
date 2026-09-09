@@ -11,6 +11,15 @@ One vault, three kinds of client:
 The backend is Rust. The web UI is hand-written HTML, CSS and JavaScript with
 no npm, no bundler and no build step — the server serves the files as they are.
 
+## Downloads
+
+Ready-to-run artifacts are on the
+[releases page](https://github.com/ION-FX/QuarkDrive/releases/latest):
+
+- `quarkdrive-0.1.0-debug.apk` — Android app (arm64-v8a + x86_64, debug-signed)
+- `quarkdrive-0.1.0-linux-x86_64.tar.gz` — server + `qd` client + web UI for Linux x86_64
+- `SHA256SUMS.txt` — checksums for the above
+
 ## Quick start
 
 ```sh
