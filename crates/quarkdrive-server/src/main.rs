@@ -158,8 +158,12 @@ async fn main() -> Result<()> {
 }
 
 fn init_logging() {
+    // tower_http at debug makes every request (method, path, status) visible,
+    // so "something went wrong" moments can be diagnosed after the fact.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("quarkdrive_server=info,info"));
+        .unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new("quarkdrive_server=info,tower_http=debug,info")
+        });
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
