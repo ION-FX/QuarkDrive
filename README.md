@@ -4,21 +4,27 @@ Self-hosted file and photo sync for Linux, the web, and Android.
 
 One vault, three kinds of client:
 
-- **Linux** — a daemon that watches a folder with inotify and syncs it continuously
+- **Linux** — a daemon that watches a folder with inotify and syncs it continuously, a native desktop app for browsing files and photos, and the browser UI
 - **Web** — a browser UI for browsing, uploading and viewing photos
 - **Android** — automatic camera backup plus browsing
 
-The backend is Rust. The web UI is hand-written HTML, CSS and JavaScript with
-no npm, no bundler and no build step — the server serves the files as they are.
+The backend is Rust. The desktop app is native Rust too (egui) — one static
+binary, no Python, no Electron, no npm. The web UI is hand-written HTML, CSS
+and JavaScript with no npm, no bundler and no build step — the server serves
+the files as they are.
 
 ## Downloads
 
 Ready-to-run artifacts are on the
 [releases page](https://github.com/ION-FX/QuarkDrive/releases/latest):
 
-- `quarkdrive-0.1.0-debug.apk` — Android app (arm64-v8a + x86_64, debug-signed)
-- `quarkdrive-0.1.0-linux-x86_64.tar.gz` — server + `qd` client + web UI for Linux x86_64
+- `quarkdrive-0.1.1-linux-x86_64.tar.gz` — server + `qd` sync client + `quarkdrive-gui` desktop app + web UI, for Linux x86_64
+- `quarkdrive-0.1.0-debug.apk` — Android app (arm64-v8a + x86_64, debug-signed; unchanged in 0.1.1)
 - `SHA256SUMS.txt` — checksums for the above
+
+Unpack the tarball and run `./quarkdrive-gui` for the desktop app: it asks
+for a server, username and password (and offers first-run sign-up on an
+empty server, like the web UI).
 
 ## Quick start
 
@@ -179,6 +185,7 @@ crates/
   quarkdrive-core    chunking, Merkle trees, crypto, merge, sync client
   quarkdrive-server  Axum server: object API, file API, thumbnails, static UI
   quarkdrive-cli     Linux client: qd init/sync/watch/status
+  quarkdrive-gui     native desktop app (egui): files, photos, uploads
   quarkdrive-ffi     JNI bindings so Android reuses the Rust core
 web/                 the browser UI (plain HTML/CSS/JS, no build step)
   themes.js          the built-in palettes and the code that applies them
@@ -212,30 +219,39 @@ node web/test-themes.js
 node web/test-app.js
 ```
 
-For an end-to-end run against a real server, see `scripts/e2e.sh`.
+For an end-to-end run against a real server, see `scripts/e2e.sh`. The
+native GUI has the same kind of harness: `scripts/test-gui.sh` starts a
+throwaway server, drives the real app through egui frames with no display
+involved (sign-in, wrong password, upload, folders, byte-identical download,
+rename, search, photo grid with live thumbnails, preview, delete), and
+software-rasterises the frames into screenshots you can eyeball afterwards.
 
 ## Notes on this build
 
-The toolchain here is Rust 1.75, which predates Cargo's MSRV-aware resolver,
-so dependencies are pinned in `Cargo.lock` to versions that build on it — most
-notably `blake3` 1.5, `ureq` 2.9, `clap` 4.5, `image` 0.24, and `axum` 0.7.
-If you are on a newer toolchain you can `cargo update` freely; `image` is
-deliberately built without default features because the EXR decoder drags in a
-rayon that needs Rust 1.80.
+Everything builds on current stable Rust (1.98 as of this writing). The
+toolchain was 1.75 until the native GUI arrived; 2026-era dependencies want
+edition-2024 crates, which 1.75's cargo cannot even parse, so the toolchain
+moved rather than pinning dozens of transitive versions. Android
+cross-compilation still works — the NDK targets are installed for the new
+toolchain and `android/build-rust.sh` is unchanged.
 
 ## Status
 
 Built and verified: the sync engine, the server, the Linux client, the web
-UI's data path, the Android app, and the PyQt6 desktop GUI. Two Linux clients
+UI's data path, the Android app, the PyQt6 desktop GUI, and the native
+desktop GUI. Two Linux clients
 were exercised end-to-end against a live server — upload, pull, deletion
 propagation, conflict handling, idle no-ops, and web-API interop. The Android
 APK builds, installs, and was driven against a live server in an emulator:
 sign-in, file listing, a real upload whose bytes arrived intact, and the JNI
 bridge (the Rust core's BLAKE3 hash matches the value the desktop core
-computes, byte for byte). The desktop GUI runs its whole flow offscreen
-against a live server with screenshots — sign-in (right and wrong password),
-listing, upload, byte-identical download, rename, delete, and the photo
-timeline with a rendered thumbnail.
+computes, byte for byte). The PyQt6 GUI runs its whole flow offscreen
+against a live server with screenshots. The native GUI does the same without
+even a window server: the test drives real egui frames headlessly — sign-in
+(right and wrong password), first-run detection, upload, folders,
+byte-identical download, rename, search, the photo grid with live decoded
+thumbnails, full-size preview, stats and delete — and a small software
+rasteriser turns the actual frames into screenshots (`/tmp/qd-gui-shots/`).
 
 Two server bugs that only real clients catch were found and fixed along the
 way: the `/stats` and `/search` routes had never been registered (the SPA

@@ -1,0 +1,15 @@
+[package]
+name = "quarkdrive-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native desktop client for Quarkdrive"
+
+[dependencies]
+eframe = "0.27"
+egui = "0.27"
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
