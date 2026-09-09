@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quarkdrive</title>
+<meta name="description" content="Quarkdrive — sync and browse your files and photos">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🌌</text></svg>">
+<link rel="stylesheet" href="styles.css">
+<script>
+/* Pick the starting view before the first paint: with a saved session token
+   the login card must not flash on reload while the token is checked.
+   app.js removes the class once it knows which view to show. */
+try {
+  if (localStorage.getItem('qd.token')) {
+    document.documentElement.classList.add('session');
+  }
+} catch (e) { /* storage unavailable -> fall back to the login view */ }
+</script>
+</head>
+<body>
+
+<!-- ------------------------------------------------------------ login -->
+<section id="login-view" class="view">
+  <form id="login-form" class="login-card panel" autocomplete="on">
+    <div class="brand">
+      <span class="brand-mark">🌌</span>
+      <h1>Quarkdrive</h1>
+      <p class="brand-tag muted">Your files, everywhere.</p>
+    </div>
+
+    <div id="signin-fields">
+      <label for="login-server">Server</label>
+      <input id="login-server" type="url" placeholder="http://localhost:8787" required value="">
+
+      <label for="login-username">Username</label>
+      <input id="login-username" type="text" placeholder="ada" required autocomplete="username">
+
+      <label for="login-password">Password</label>
+      <input id="login-password" type="password" placeholder="••••••••" required
+             autocomplete="current-password">
+
+      <button id="login-submit" class="primary" type="submit">Sign in</button>
+      <p class="hint auth-switch">First time on this server?
+        <a href="#" id="to-signup">Create the first account</a></p>
+    </div>
+
+    <div id="signup-fields" hidden>
+      <p class="hint" style="margin:0 0 10px">
+        This server has no accounts yet. Create the first one — registration
+        closes as soon as it exists.
+      </p>
+
+      <label for="signup-server">Server</label>
+      <input id="signup-server" type="url" placeholder="http://localhost:8787" required value="">
+
+      <label for="signup-username">Username</label>
+      <input id="signup-username" type="text" placeholder="ada" required
+             autocomplete="username" maxlength="40">
+
+      <label for="signup-password">Password</label>
+      <input id="signup-password" type="password" placeholder="At least 6 characters" required
+             autocomplete="new-password">
+
+      <label for="signup-confirm">Confirm password</label>
+      <input id="signup-confirm" type="password" placeholder="Once more" required
+             autocomplete="new-password">
+
+      <label for="signup-vault">Your first vault</label>
+      <input id="signup-vault" type="text" placeholder="photos" maxlength="60">
+
+      <button id="signup-submit" class="primary" type="submit">Create account</button>
+      <p class="hint auth-switch">Already have an account?
+        <a href="#" id="to-signin">Sign in</a></p>
+    </div>
+
+    <p id="login-error" class="error" role="alert" hidden></p>
+  </form>
+</section>
+
+<!-- ------------------------------------------------------------- main -->
+<section id="main-view" class="view" hidden>
+  <header class="topbar panel">
+    <div class="brand-small">
+      <span class="brand-mark">🌌</span>
+      <span>Quarkdrive</span>
+    </div>
+
+    <nav class="tabs" role="tablist">
+      <button id="tab-files"  class="tab active" role="tab" aria-selected="true">Files</button>
+      <button id="tab-photos" class="tab"        role="tab" aria-selected="false">Photos</button>
+    </nav>
+
+    <div class="topbar-right">
+      <select id="vault-select" class="vault-select" title="Vault"></select>
+      <button id="btn-new-vault" class="icon-btn" title="New vault" aria-label="New vault">＋</button>
+      <button id="btn-theme" class="icon-btn" title="Themes" aria-label="Themes">🎨</button>
+      <button id="logout" class="ghost" title="Sign out">Sign out</button>
+    </div>
+  </header>
+
+  <!-- files -->
+  <div id="files-view" class="pane">
+    <div class="toolbar">
+      <nav id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></nav>
+      <div class="toolbar-actions">
+        <input id="filter-input" class="filter" type="search"
+               placeholder="Filter this folder…" aria-label="Filter this folder">
+        <input id="file-input" type="file" multiple hidden>
+        <button id="btn-upload" class="ghost">Upload</button>
+        <button id="btn-newfolder" class="ghost">New folder</button>
+      </div>
+    </div>
+
+    <div id="dropzone" class="dropzone">
+      <ul id="entry-list" class="entry-list" aria-live="polite"></ul>
+      <div id="drop-hint" class="drop-hint" hidden>Drop files to upload</div>
+    </div>
+  </div>
+
+  <!-- photos -->
+  <div id="photos-view" class="pane" hidden>
+    <div id="timeline" class="timeline" aria-live="polite"></div>
+  </div>
+
+  <footer id="statusbar" class="statusbar panel"></footer>
+</section>
+
+<!-- ------------------------------------------------------ theme drawer -->
+<div id="theme-scrim" class="scrim" hidden></div>
+<aside id="theme-drawer" class="drawer" hidden role="dialog" aria-label="Themes">
+  <div class="drawer-head">
+    <h2>Themes</h2>
+    <button id="theme-close" class="icon-btn" aria-label="Close themes">✕</button>
+  </div>
+
+  <div class="drawer-body">
+    <div id="theme-list" class="theme-grid"></div>
+
+    <div class="drawer-section">
+      <h3>Make your own</h3>
+      <p class="hint" style="margin:0 0 10px">
+        Start from any theme, change the colours, add a background image.
+        Themes are saved in this browser and can be exported as a file.
+      </p>
+      <div class="drawer-row">
+        <button id="btn-new-theme" class="primary">New theme</button>
+        <button id="btn-import-theme" class="ghost">Import…</button>
+      </div>
+      <input id="import-file" type="file" accept="application/json,.json" hidden>
+    </div>
+  </div>
+
+  <div class="drawer-foot">
+    <button id="btn-reset-theme" class="subtle">Reset to Galaxy</button>
+  </div>
+</aside>
+
+<!-- --------------------------------------------------- theme editor -->
+<div id="theme-editor" class="modal" hidden role="dialog" aria-modal="true" aria-label="Theme editor">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2 id="te-title">New theme</h2>
+      <button id="te-close" class="icon-btn" aria-label="Close editor">✕</button>
+    </div>
+    <p class="hint">Changes preview immediately. Nothing is saved until you press Save.</p>
+
+    <div class="field">
+      <label for="te-name">Name</label>
+      <input id="te-name" type="text" placeholder="My theme" maxlength="40">
+    </div>
+
+    <div class="field">
+      <label for="te-base">Start from</label>
+      <select id="te-base"></select>
+    </div>
+
+    <div class="field">
+      <label>Colours</label>
+      <div id="te-colours" class="colour-grid"></div>
+    </div>
+
+    <div class="field">
+      <label>Background</label>
+      <div id="te-bg-preview" class="bg-preview"></div>
+      <input id="te-bg-url" type="url" placeholder="https://example.com/backdrop.jpg">
+      <div class="drawer-row" style="margin-top:8px">
+        <button id="te-bg-file" class="ghost">Upload image…</button>
+        <button id="te-bg-clear" class="subtle">Remove image</button>
+      </div>
+      <input id="te-bg-file-input" type="file" accept="image/*" hidden>
+      <p class="hint">
+        Large pictures are shrunk to fit a screen before they are stored, so a
+        photo stays well inside the browser's limits.
+      </p>
+    </div>
+
+    <p id="te-error" class="error" role="alert" hidden></p>
+
+    <div class="modal-actions">
+      <button id="te-export" class="ghost">Export…</button>
+      <button id="te-delete" class="danger" hidden>Delete</button>
+      <button id="te-cancel" class="ghost">Cancel</button>
+      <button id="te-save" class="primary">Save &amp; use</button>
+    </div>
+  </div>
+</div>
+
+<!-- ---------------------------------------------------------- lightbox -->
+<div id="lightbox" class="lightbox" hidden role="dialog" aria-modal="true">
+  <button id="lb-close" class="lb-btn lb-close" aria-label="Close">✕</button>
+  <button id="lb-prev"  class="lb-btn lb-prev"  aria-label="Previous">‹</button>
+  <img id="lb-image" alt="">
+  <button id="lb-next"  class="lb-btn lb-next"  aria-label="Next">›</button>
+  <div id="lb-caption" class="lb-caption"></div>
+</div>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<script src="themes.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

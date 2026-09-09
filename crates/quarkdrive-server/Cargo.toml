@@ -1,0 +1,43 @@
+[package]
+name = "quarkdrive-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Quarkdrive sync and file server"
+
+[dependencies]
+quarkdrive-core = { path = "../quarkdrive-core" }
+
+axum = "0.7"
+tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
+tokio = { version = "1.35", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Default features pull in the EXR decoder, which pulls in a rayon version
+# that needs a newer rustc than this build targets. Only the formats a photo
+# vault actually serves are enabled.
+image = { version = "0.24", default-features = false, features = [
+    "jpeg",
+    "png",
+    "gif",
+    "webp",
+    "bmp",
+    "tiff",
+] }
+kamadak-exif = "0.5"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+thiserror = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+base64 = "0.21"
+rand = "0.8"
+hex = "0.4"
+
+[dev-dependencies]
+quarkdrive-core = { path = "../quarkdrive-core", features = ["testing"] }

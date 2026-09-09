@@ -1,0 +1,30 @@
+[package]
+name = "quarkdrive-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Content-defined sync engine: chunking, Merkle trees, convergent E2EE, merge"
+
+[dependencies]
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+blake3 = "1.5"
+hex = "0.4"
+base64 = "0.21"
+rand = "0.8"
+zeroize = "1.7"
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+zstd = "0.13"
+rusqlite = { version = "0.31", features = ["bundled"] }
+walkdir = "2"
+filetime = "0.2"
+ureq = "2.9"
+tracing = "0.1"
+
+[features]
+# Exposes the shared test helpers to other crates in the workspace. Not
+# enabled by default so they stay out of release builds.
+testing = []

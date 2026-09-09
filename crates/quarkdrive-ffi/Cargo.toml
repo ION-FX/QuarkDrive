@@ -1,0 +1,14 @@
+[package]
+name = "quarkdrive-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "JNI bindings exposing the Quarkdrive sync engine to Android"
+
+[lib]
+# Built as a shared library and loaded by System.loadLibrary("quarkdrive_ffi").
+crate-type = ["cdylib"]
+
+[dependencies]
+quarkdrive-core = { path = "../quarkdrive-core" }
+jni = "0.21"

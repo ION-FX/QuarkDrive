@@ -1,0 +1,24 @@
+# Rust
+/target
+**/*.rs.bk
+*.profraw
+
+# Server state: users, tokens, vault contents. Never publish this.
+quarkdrive-data/
+
+# Android / Gradle build artifacts
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/app/src/main/jniLibs/**/*.so
+*.apk
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors
+.idea/
+.vscode/
+*.swp
