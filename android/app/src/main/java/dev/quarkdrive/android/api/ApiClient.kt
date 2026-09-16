@@ -63,6 +63,29 @@ class ApiClient(
 
     fun absoluteUrl(serverRelative: String) = base() + serverRelative
 
+    /**
+     * Direct URL for a file's bytes.
+     *
+     * Image loaders need a URL rather than a byte array, and they attach the
+     * bearer token themselves as a header.
+     */
+    fun downloadUrl(vault: String, path: String) =
+        url(vault, "/fs/download?path=${encode(path)}")
+
+    /**
+     * Name search across the whole vault.
+     *
+     * The server walks the tree, so this finds files in folders the user has
+     * not opened — unlike filtering the current listing.
+     */
+    suspend fun search(vault: String, query: String, limit: Int = 100): List<Entry> =
+        withContext(Dispatchers.IO) {
+            val body = execute(
+                authed(url(vault, "/search?q=${encode(query)}&limit=$limit")).get().build()
+            )
+            parseEntries(body)
+        }
+
     suspend fun list(vault: String, path: String = ""): List<Entry> = withContext(Dispatchers.IO) {
         val query = if (path.isBlank()) "" else "?path=${encode(path)}"
         val body = execute(authed(url(vault, "/fs$query")).get().build())
