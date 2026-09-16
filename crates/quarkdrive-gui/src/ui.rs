@@ -204,13 +204,30 @@ fn login_ui(app: &mut App, ui: &mut egui::Ui) {
 
         ui.add_space(8.0);
 
-        let (label, explain) = match app.signup_hint {
-            None => ("Connect", "checking the server…"),
-            Some(true) => (
-                "Create account",
-                "this server has no accounts yet — create the first one",
-            ),
-            Some(false) => ("Sign in", ""),
+        if app.pending_totp.is_some() {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label("Code");
+            });
+            ui.add(
+                TextEdit::singleline(&mut app.totp_buf)
+                    .password(true)
+                    .desired_width(300.0)
+                    .hint_text("123456"),
+            );
+            ui.end_row();
+        }
+
+        let (label, explain) = if app.pending_totp.is_some() {
+            ("Verify", "enter the six-digit code from your authenticator")
+        } else {
+            match app.signup_hint {
+                None => ("Connect", "checking the server…"),
+                Some(true) => (
+                    "Create account",
+                    "this server has no accounts yet — create the first one",
+                ),
+                Some(false) => ("Sign in", ""),
+            }
         };
         if ui
             .add_enabled(app.busy == 0, egui::Button::new(RichText::new(label).strong()))
@@ -224,7 +241,10 @@ fn login_ui(app: &mut App, ui: &mut egui::Ui) {
 
         if let Some(err) = &app.login_err {
             ui.add_space(4.0);
-            ui.label(RichText::new(err).color(ERR));
+            let hint = app.pending_totp.is_some();
+            ui.label(
+                RichText::new(err).color(if hint { MUTED } else { ERR }),
+            );
         }
         ui.add_space(24.0);
         ui.label(

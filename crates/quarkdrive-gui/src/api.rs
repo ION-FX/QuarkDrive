@@ -15,6 +15,13 @@ const MAX_ERROR_BODY: u64 = 4096;
 /// Thumbnails are server-side JPEGs at most ~2048px; this is generous.
 const THUMB_LIMIT: u64 = 64 * 1024 * 1024;
 
+/// What a password sign-in produced: a session, or a 2FA challenge.
+#[derive(Debug, Clone)]
+pub enum LoginOutcome {
+    Token(String),
+    TotpRequired(String),
+}
+
 #[derive(Clone)]
 pub struct Api {
     agent: ureq::Agent,
@@ -54,12 +61,47 @@ impl Api {
         Ok(resp.into_json::<Status>().map_err(|e| e.to_string())?.first_run)
     }
 
-    /// POST /auth/login → bearer token for later calls.
-    pub fn login(server: &str, username: &str, password: &str) -> Result<(String, String), String> {
+    /// POST /auth/login → either a token or a pending 2FA challenge.
+    pub fn login(server: &str, username: &str, password: &str) -> Result<LoginOutcome, String> {
         let url = format!("{}/api/v1/auth/login", normalise_server(server)?);
         let resp = agent()?
             .post(&url)
             .send_json(serde_json::json!({ "username": username, "password": password }))
+            .map_err(explain)?;
+        let r = resp
+            .into_json::<serde_json::Value>()
+            .map_err(|e| e.to_string())?;
+        if r.get("totp_required").and_then(|v| v.as_bool()) == Some(true) {
+            let pending = r
+                .get("pending")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            return Ok(LoginOutcome::TotpRequired(pending));
+        }
+        let token = r
+            .get("token")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        Ok(LoginOutcome::Token(token))
+    }
+
+    /// POST /auth/login/totp → exchange pending + code for a token.
+    pub fn login_totp(
+        server: &str,
+        username: &str,
+        pending: &str,
+        code: &str,
+    ) -> Result<(String, String), String> {
+        let url = format!("{}/api/v1/auth/login/totp", normalise_server(server)?);
+        let resp = agent()?
+            .post(&url)
+            .send_json(serde_json::json!({
+                "username": username,
+                "pending": pending,
+                "code": code,
+            }))
             .map_err(explain)?;
         #[derive(Deserialize)]
         struct Resp {

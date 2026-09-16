@@ -75,6 +75,10 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub db: Db,
     pub logins: LoginLimiter,
+    /// Half-signed-in sessions: a login with the right password and 2FA
+    /// enabled gets a pending id, valid five minutes, that only the
+    /// /auth/login/totp endpoint will exchange for a real token.
+    pending_totps: Mutex<HashMap<String, (String, Instant)>>,
     vaults: Mutex<HashMap<String, Arc<Vault>>>,
     indexes: Mutex<HashMap<String, Arc<MediaIndex>>>,
 }
@@ -82,11 +86,13 @@ pub struct AppState {
 impl AppState {
     pub fn new(data_dir: PathBuf) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir.join("vaults"))?;
+        std::fs::create_dir_all(data_dir.join("uploads"))?;
         let db = Db::open(&data_dir.join("server.db"))?;
         Ok(AppState {
             data_dir,
             db,
             logins: LoginLimiter::default(),
+            pending_totps: Mutex::new(HashMap::new()),
             vaults: Mutex::new(HashMap::new()),
             indexes: Mutex::new(HashMap::new()),
         })
@@ -204,6 +210,14 @@ impl ApiError {
 
     pub fn not_found(message: impl Into<String>) -> Self {
         ApiError::new(StatusCode::NOT_FOUND, message)
+    }
+
+    /// A chunk that does not line up with what the server has.
+    pub fn conflict_with_offset(received: u64) -> Self {
+        ApiError {
+            status: StatusCode::CONFLICT,
+            body: serde_json::json!({ "error": "offset mismatch", "received": received }),
+        }
     }
 
     /// A commit that lost the race to another device.
@@ -413,7 +427,7 @@ async fn login(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<LoginReq>,
-) -> Result<Json<LoginResp>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let key = LoginLimiter::key(addr.ip(), &req.username);
     if !state.logins.allowed(&key, Instant::now()) {
         return Err(ApiError::new(
@@ -430,11 +444,173 @@ async fn login(
             ApiError::new(StatusCode::UNAUTHORIZED, "invalid username or password")
         })?;
     state.logins.clear(&key);
+
+    // Correct password + 2FA on: hand out a pending id, not a token.
+    if let Some((_, true)) = state.db.totp_for_user(&user_id)? {
+        let pending = crate::db::Db::pending_id();
+        state.pending_totps.lock().unwrap().insert(
+            pending.clone(),
+            (user_id, Instant::now()),
+        );
+        return Ok(Json(serde_json::json!({
+            "totp_required": true,
+            "pending": pending,
+        })));
+    }
+
     let token = state
         .db
         .create_token(&user_id, None)
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(LoginResp { token, user_id }))
+    Ok(Json(serde_json::json!({
+        "token": token,
+        "user_id": user_id,
+    })))
+}
+
+#[derive(Deserialize)]
+struct TotpLoginReq {
+    username: String,
+    pending: String,
+    code: String,
+}
+
+/// Exchange a pending id plus a live TOTP code for a real token.
+async fn login_totp(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<TotpLoginReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let key = LoginLimiter::key(addr.ip(), &req.username);
+    if !state.logins.allowed(&key, Instant::now()) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed sign-ins — wait ten minutes and try again",
+        ));
+    }
+
+    let entry = state
+        .pending_totps
+        .lock()
+        .unwrap()
+        .get(&req.pending)
+        .cloned();
+    let Some((user_id, created)) = entry else {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "this sign-in session expired — start again",
+        ));
+    };
+    if created.elapsed() > std::time::Duration::from_secs(300) {
+        state.pending_totps.lock().unwrap().remove(&req.pending);
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "this sign-in session expired — start again",
+        ));
+    }
+
+    let (secret, enabled) = state
+        .db
+        .totp_for_user(&user_id)?
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "two-factor is not set up"))?;
+    if !enabled {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "two-factor is not enabled"));
+    }
+
+    if !crate::totp::verify(&secret, &req.code, now_secs()) {
+        state.logins.record_failure(key.clone(), Instant::now());
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "that code is not right — codes change every 30 seconds",
+        ));
+    }
+    state.logins.clear(&key);
+    state.pending_totps.lock().unwrap().remove(&req.pending);
+
+    let token = state
+        .db
+        .create_token(&user_id, Some("totp-login"))
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "token": token, "user_id": user_id })))
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+// ------------------------------------------------- two-factor enrollment
+
+/// Generate a secret for the signed-in user. It is stored unconfirmed: the
+/// account only gains 2FA after a code from the authenticator checks out.
+async fn totp_setup(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let username = state
+        .db
+        .username_for_id(&user_id)?
+        .unwrap_or_else(|| "user".to_string());
+    let secret = crate::totp::generate_secret();
+    state.db.set_totp_secret(&user_id, &secret)?;
+    Ok(Json(serde_json::json!({
+        "secret": secret,
+        "otpauth": crate::totp::otpauth_uri(&secret, &username),
+    })))
+}
+
+#[derive(Deserialize)]
+struct TotpCodeReq {
+    code: String,
+}
+
+async fn totp_enable(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<TotpCodeReq>,
+) -> Result<Json<OkResp>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let (secret, _) = state
+        .db
+        .totp_for_user(&user_id)?
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "run setup first"))?;
+    if !crate::totp::verify(&secret, &req.code, now_secs()) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "that code is not right — codes change every 30 seconds",
+        ));
+    }
+    state.db.enable_totp(&user_id)?;
+    Ok(Json(OkResp { ok: true }))
+}
+
+async fn totp_disable(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<TotpCodeReq>,
+) -> Result<Json<OkResp>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    // If a secret exists, demand a live code — 2FA that any stolen session
+    // could switch off would be decoration.
+    if let Some((secret, _)) = state.db.totp_for_user(&user_id)? {
+        if !crate::totp::verify(&secret, &req.code, now_secs()) {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "that code is not right"));
+        }
+    }
+    state.db.disable_totp(&user_id)?;
+    Ok(Json(OkResp { ok: true }))
+}
+
+async fn totp_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let enabled = matches!(state.db.totp_for_user(&user_id)?, Some((_, true)));
+    Ok(Json(serde_json::json!({ "enabled": enabled })))
 }
 
 #[derive(Deserialize)]
@@ -570,6 +746,194 @@ async fn create_vault(
         created: row.created,
         role: "owner",
     }))
+}
+
+// ---------------------------------------------------- resumable uploads
+
+/// Where partially-uploaded bytes wait for the rest of the file.
+fn part_path(state: &AppState, session: &str) -> PathBuf {
+    state.data_dir.join("uploads").join(format!("{session}.part"))
+}
+
+fn upload_view(row: &crate::db::UploadRow) -> serde_json::Value {
+    serde_json::json!({
+        "session": row.session,
+        "path": row.path,
+        "size": row.size,
+        "received": row.received,
+    })
+}
+
+/// Begin a chunked upload. The client decides its own chunk size; between
+/// chunks it can ask GET for `received` and pick up where it left off, so
+/// a flaky link or a laptop going to sleep never restarts a 3 GB upload.
+async fn upload_start(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vault): Path<String>,
+    Json(req): Json<StartUploadReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if !role.can_write() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this vault is shared with you read-only",
+        ));
+    }
+    if req.path.trim().is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "path is required"));
+    }
+    if req.size as usize > MAX_UPLOAD_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file is larger than this server accepts",
+        ));
+    }
+    let session = state
+        .db
+        .create_upload(&v.row.id, &req.path, req.size as u64)
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    std::fs::File::create(part_path(&state, &session))
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "session": session, "received": 0 })))
+}
+
+#[derive(Deserialize)]
+struct ChunkQuery {
+    offset: u64,
+}
+
+/// Append one chunk at the exact offset the server expects. A mismatch
+/// (lost chunk, replayed request) answers 409 with the true offset so the
+/// client can rewind — that exchange is what makes the upload resumable.
+async fn upload_chunk(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((vault, session)): Path<(String, String)>,
+    Query(q): Query<ChunkQuery>,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if !role.can_write() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this vault is shared with you read-only",
+        ));
+    }
+    let row = state
+        .db
+        .upload_get(&session)?
+        .ok_or_else(|| ApiError::not_found("no such upload session"))?;
+    if row.vault_id != v.row.id {
+        return Err(ApiError::not_found("no such upload session"));
+    }
+    if q.offset != row.received {
+        return Err(ApiError::conflict_with_offset(row.received));
+    }
+    use std::io::Write as _;
+    let mut part = std::fs::OpenOptions::new()
+        .append(true)
+        .open(part_path(&state, &session))
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Guard against a chunk arriving twice: the file must be exactly as
+    // long as the recorded offset before we append.
+    if part.metadata().map(|m| m.len()).unwrap_or(0) != row.received {
+        return Err(ApiError::conflict_with_offset(row.received));
+    }
+    part.write_all(&body)
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    state
+        .db
+        .upload_record_bytes(&session, body.len() as u64)
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "received": row.received + body.len() as u64 })))
+}
+
+async fn upload_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((vault, session)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let (v, _role) = state.vault(&vault, &user_id)?;
+    let row = state
+        .db
+        .upload_get(&session)?
+        .filter(|r| r.vault_id == v.row.id)
+        .ok_or_else(|| ApiError::not_found("no such upload session"))?;
+    Ok(Json(upload_view(&row)))
+}
+
+async fn upload_finish(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((vault, session)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if !role.can_write() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this vault is shared with you read-only",
+        ));
+    }
+    let row = state
+        .db
+        .upload_get(&session)?
+        .filter(|r| r.vault_id == v.row.id)
+        .ok_or_else(|| ApiError::not_found("no such upload session"))?;
+    let bytes = std::fs::read(part_path(&state, &session))
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if bytes.len() as u64 != row.size {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "upload incomplete: {} of {} bytes received",
+                bytes.len(),
+                row.size
+            ),
+        ));
+    }
+    v.put_file(&row.path, &bytes, None)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+    state.db.upload_delete(&session)?;
+    let _ = std::fs::remove_file(part_path(&state, &session));
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "path": row.path,
+        "size": row.size,
+    })))
+}
+
+async fn upload_cancel(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((vault, session)): Path<(String, String)>,
+) -> Result<Json<OkResp>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if !role.can_write() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this vault is shared with you read-only",
+        ));
+    }
+    let row = state
+        .db
+        .upload_get(&session)?
+        .filter(|r| r.vault_id == v.row.id)
+        .ok_or_else(|| ApiError::not_found("no such upload session"))?;
+    state.db.upload_delete(&session)?;
+    let _ = std::fs::remove_file(part_path(&state, &row.session));
+    Ok(Json(OkResp { ok: true }))
+}
+
+#[derive(Deserialize)]
+struct StartUploadReq {
+    path: String,
+    size: usize,
 }
 
 // ---------------------------------------------------------------- shares
@@ -1631,12 +1995,6 @@ async fn timeline(
 
 // ------------------------------------------------------------------ helpers
 
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
 
 /// Percent-encode a path for use in a query string.
 fn urlencode(s: &str) -> String {
@@ -1665,6 +2023,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/register", post(register))
         .route("/api/v1/auth/status", get(auth_status))
+        .route("/api/v1/auth/login/totp", post(login_totp))
+        .route("/api/v1/auth/totp", get(totp_status))
+        .route("/api/v1/auth/totp/setup", post(totp_setup))
+        .route("/api/v1/auth/totp/enable", post(totp_enable))
+        .route("/api/v1/auth/totp/disable", post(totp_disable))
         .route("/api/v1/whoami", get(whoami))
         .route("/api/v1/vaults", get(list_vaults).post(create_vault))
         .route(
@@ -1694,6 +2057,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/public/:id", get(public_meta))
         .route("/api/v1/public/:id/list", get(public_list))
         .route("/api/v1/public/:id/download", get(public_download))
+        .route("/api/v1/vaults/:vault/fs/resume", post(upload_start))
+        .route(
+            "/api/v1/vaults/:vault/fs/resume/:session",
+            get(upload_status).put(upload_chunk).delete(upload_cancel),
+        )
+        .route(
+            "/api/v1/vaults/:vault/fs/resume/:session/finish",
+            post(upload_finish),
+        )
         // Object protocol used by the desktop and Android sync engine.
         .route("/api/v1/vaults/:vault/head", get(get_head))
         .route("/api/v1/vaults/:vault/snapshots/:id", get(get_snapshot))

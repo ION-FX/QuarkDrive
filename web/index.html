@@ -40,6 +40,12 @@ try {
       <input id="login-password" type="password" placeholder="••••••••" required
              autocomplete="current-password">
 
+      <div id="totp-fields" hidden>
+        <label for="login-totp">Two-factor code</label>
+        <input id="login-totp" type="text" inputmode="numeric" placeholder="123456"
+               autocomplete="one-time-code" maxlength="6">
+      </div>
+
       <button id="login-submit" class="primary" type="submit">Sign in</button>
       <p class="hint auth-switch">First time on this server?
         <a href="#" id="to-signup">Create the first account</a></p>
@@ -96,6 +102,7 @@ try {
       <select id="vault-select" class="vault-select" title="Vault"></select>
       <button id="btn-new-vault" class="icon-btn" title="New vault" aria-label="New vault">＋</button>
       <button id="btn-share" class="icon-btn" title="Sharing" aria-label="Sharing" hidden>👥</button>
+      <button id="btn-2fa" class="icon-btn" title="Two-factor sign-in" aria-label="Two-factor">🔒</button>
       <button id="btn-theme" class="icon-btn" title="Themes" aria-label="Themes">🎨</button>
       <button id="logout" class="ghost" title="Sign out">Sign out</button>
     </div>
@@ -183,6 +190,50 @@ try {
       manage shares, and end-to-end encrypted vaults cannot be shared — the
       recipient has no key.
     </p>
+  </div>
+</aside>
+
+<!-- ------------------------------------------------------- 2FA drawer -->
+<div id="tfa-scrim" class="scrim" hidden></div>
+<aside id="tfa-drawer" class="drawer" hidden role="dialog" aria-label="Two-factor sign-in">
+  <div class="drawer-head">
+    <h2>Two-factor sign-in</h2>
+    <button id="tfa-close" class="icon-btn" aria-label="Close">✕</button>
+  </div>
+
+  <div class="drawer-body">
+    <p class="hint" id="tfa-status"></p>
+
+    <div id="tfa-setup" hidden>
+      <p class="hint" style="margin:0 0 8px">
+        1. Add this secret to your authenticator app (Aegis, 1Password,
+        Google Authenticator, …). 2. Enter the current code to confirm.
+      </p>
+      <p class="mono" id="tfa-secret" style="word-break:break-all"></p>
+      <p class="hint mono" id="tfa-uri" style="word-break:break-all"></p>
+      <div class="drawer-row">
+        <input id="tfa-code" type="text" inputmode="numeric" placeholder="123456"
+               maxlength="6" autocomplete="one-time-code" style="flex:1">
+        <button id="btn-tfa-enable" class="primary">Confirm &amp; enable</button>
+      </div>
+    </div>
+
+    <div id="tfa-disable" hidden>
+      <p class="hint" style="margin:0 0 8px">
+        Two-factor is on. Enter the current code to turn it off.
+      </p>
+      <div class="drawer-row">
+        <input id="tfa-code-off" type="text" inputmode="numeric" placeholder="123456"
+               maxlength="6" style="flex:1">
+        <button id="btn-tfa-disable" class="danger">Disable</button>
+      </div>
+    </div>
+
+    <div id="tfa-start" hidden>
+      <button id="btn-tfa-setup" class="primary">Set up two-factor</button>
+    </div>
+
+    <p id="tfa-error" class="error" role="alert" hidden></p>
   </div>
 </aside>
 

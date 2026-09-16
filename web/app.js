@@ -42,6 +42,9 @@ const state = {
   trash: [],
   /** "owner", "write" or "read" — how this user holds the current vault. */
   vaultRole: 'owner',
+  /** Half-signed-in 2FA session: pending id + username awaiting a code. */
+  totpPending: null,
+  totpUsername: '',
 };
 
 /* ------------------------------------------------------------- helpers */
@@ -133,6 +136,41 @@ async function signIn(server, username, password) {
     throw new Error(message);
   }
   const data = await res.json();
+  if (data.totp_required) {
+    // The password was right; the code is still missing. Keep the sign-in
+    // form open for the next step rather than storing nothing.
+    state.totpPending = data.pending;
+    state.totpUsername = username;
+    const fields = document.getElementById('totp-fields');
+    if (fields) fields.hidden = false;
+    const input = document.getElementById('login-totp');
+    if (input) input.focus();
+    throw new TotpRequired();
+  }
+  state.server = server.replace(/\/+$/, '');
+  state.token = data.token;
+  localStorage.setItem(STORAGE.server, state.server);
+  localStorage.setItem(STORAGE.token, state.token);
+}
+
+/** An internal signal: the password was accepted, a code is wanted. */
+class TotpRequired extends Error {
+  constructor() { super('two-factor code required'); this.totp = true; }
+}
+
+/** Second half of a 2FA sign-in: exchange pending + code for a token. */
+async function verifyTotp(server, username, pending, code) {
+  const res = await fetch(`${server.replace(/\/+$/, '')}/api/v1/auth/login/totp`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, pending, code }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `${res.status} ${res.statusText}`);
+  }
+  const data = await res.json();
+  state.totpPending = null;
   state.server = server.replace(/\/+$/, '');
   state.token = data.token;
   localStorage.setItem(STORAGE.server, state.server);
@@ -528,11 +566,17 @@ async function uploadFiles(fileList) {
   for (const file of files) {
     const rel = state.path ? `${state.path}/${file.name}` : file.name;
     try {
-      await api(vaultApi(`/fs?path=${encodeURIComponent(rel)}`), {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: file,
-      });
+      // Big files go chunk by chunk: a dropped connection resumes at the
+      // last received offset instead of starting a 3 GB upload over.
+      if (file.size > 8 * 1024 * 1024) {
+        await uploadInChunks(rel, file);
+      } else {
+        await api(vaultApi(`/fs?path=${encodeURIComponent(rel)}`), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: file,
+        });
+      }
       done += 1;
       setStatus(`Uploading ${done}/${files.length}…`);
     } catch (e) {
@@ -541,6 +585,31 @@ async function uploadFiles(fileList) {
   }
   if (done) toast(`Uploaded ${done} file${done === 1 ? '' : 's'}`, 'ok');
   await refreshAfterChange();
+}
+
+const CHUNK_SIZE = 4 * 1024 * 1024;
+
+async function uploadInChunks(rel, file) {
+  const start = await (await api(vaultApi('/fs/resume'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: rel, size: file.size }),
+  })).json();
+  let offset = start.received;
+  while (offset < file.size) {
+    const chunk = file.slice(offset, offset + CHUNK_SIZE);
+    let res = await api(
+      vaultApi(`/fs/resume/${encodeURIComponent(start.session)}?offset=${offset}`),
+      { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' }, body: chunk },
+    );
+    const data = await res.json();
+    offset = data.received;
+    setStatus(`Uploading ${rel}: ${Math.floor((offset / file.size) * 100)}%`);
+  }
+  await api(
+    vaultApi(`/fs/resume/${encodeURIComponent(start.session)}/finish`),
+    { method: 'POST' },
+  );
 }
 
 async function createFolder() {
@@ -1496,6 +1565,98 @@ async function downloadVersion(v, restore) {
   }
 }
 
+/* ------------------------------------------------- two-factor settings */
+
+async function openTfaDrawer() {
+  const drawer = document.getElementById('tfa-drawer');
+  const scrim = document.getElementById('tfa-scrim');
+  if (!drawer || !scrim) return;
+  drawer.hidden = false;
+  scrim.hidden = false;
+  const data = await (await api('/api/v1/auth/totp')).json();
+  showTfaState(data.enabled);
+}
+
+function showTfaState(enabled) {
+  const status = document.getElementById('tfa-status');
+  const setup = document.getElementById('tfa-setup');
+  const disable = document.getElementById('tfa-disable');
+  const start = document.getElementById('tfa-start');
+  if (!status || !setup || !disable || !start) return;
+  status.textContent = enabled
+    ? 'Signing in to this account needs a code from your authenticator.'
+    : 'Add a second factor: sign-ins then need a six-digit code from an authenticator app.';
+  setup.hidden = enabled;
+  disable.hidden = !enabled;
+  start.hidden = enabled;
+}
+
+async function tfaSetup() {
+  const err = document.getElementById('tfa-error');
+  if (err) err.hidden = true;
+  const data = await (await api('/api/v1/auth/totp/setup', { method: 'POST' })).json();
+  const secret = document.getElementById('tfa-secret');
+  const uri = document.getElementById('tfa-uri');
+  if (secret) secret.textContent = `Secret: ${data.secret}`;
+  if (uri) uri.textContent = data.otpauth;
+  showTfaState(false);
+  const setupBox = document.getElementById('tfa-setup');
+  if (setupBox) setupBox.hidden = false;
+  const start = document.getElementById('tfa-start');
+  if (start) start.hidden = true;
+}
+
+async function tfaEnable() {
+  const err = document.getElementById('tfa-error');
+  if (err) err.hidden = true;
+  const code = document.getElementById('tfa-code').value.trim();
+  if (!code) return;
+  try {
+    await api('/api/v1/auth/totp/enable', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+    });
+    toast('Two-factor enabled', 'ok');
+    document.getElementById('tfa-code').value = '';
+    showTfaState(true);
+  } catch (e) {
+    if (err) {
+      err.textContent = e.message;
+      err.hidden = false;
+    }
+  }
+}
+
+async function tfaDisable() {
+  const err = document.getElementById('tfa-error');
+  if (err) err.hidden = true;
+  const code = document.getElementById('tfa-code-off').value.trim();
+  if (!code) return;
+  try {
+    await api('/api/v1/auth/totp/disable', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+    });
+    toast('Two-factor disabled', 'ok');
+    document.getElementById('tfa-code-off').value = '';
+    showTfaState(false);
+  } catch (e) {
+    if (err) {
+      err.textContent = e.message;
+      err.hidden = false;
+    }
+  }
+}
+
+function closeTfaDrawer() {
+  const drawer = document.getElementById('tfa-drawer');
+  const scrim = document.getElementById('tfa-scrim');
+  if (drawer) drawer.hidden = true;
+  if (scrim) scrim.hidden = true;
+}
+
 /* ------------------------------------------------------------ wiring */
 
 function selectTab(which) {
@@ -1661,11 +1822,23 @@ function init() {
     const server = $('#login-server').value.trim();
     const username = $('#login-username').value.trim();
     const password = $('#login-password').value;
+    const code = document.getElementById('login-totp');
     $('#login-submit').disabled = true;
     try {
-      await signIn(server, username, password);
+      if (state.totpPending && code && code.value.trim()) {
+        await verifyTotp(server, username, state.totpPending, code.value.trim());
+      } else {
+        await signIn(server, username, password);
+      }
+      const totpFields = document.getElementById('totp-fields');
+      if (totpFields) totpFields.hidden = true;
       await start();
     } catch (e) {
+      if (e && e.totp) {
+        // Not an error: the code field is now showing.
+        loginError.hidden = true;
+        return;
+      }
       // A fetch that never reached the server throws a TypeError with a
       // browser-specific message, which does not help distinguish "wrong
       // password" from "wrong address".
@@ -1733,6 +1906,21 @@ function init() {
   if (btnCreateLink) btnCreateLink.addEventListener('click', () => createLink().catch(() => {}));
   const versionsClose = document.getElementById('versions-close');
   if (versionsClose) versionsClose.addEventListener('click', closeVersions);
+  const btn2fa = document.getElementById('btn-2fa');
+  if (btn2fa) btn2fa.addEventListener('click', () => openTfaDrawer().catch((e) => toast(e.message, 'error')));
+  const tfaClose = document.getElementById('tfa-close');
+  if (tfaClose) tfaClose.addEventListener('click', closeTfaDrawer);
+  const tfaScrim = document.getElementById('tfa-scrim');
+  if (tfaScrim) tfaScrim.addEventListener('click', closeTfaDrawer);
+  const btnTfaSetup = document.getElementById('btn-tfa-setup');
+  if (btnTfaSetup) btnTfaSetup.addEventListener('click', () => tfaSetup().catch((e) => {
+    const err = document.getElementById('tfa-error');
+    if (err) { err.textContent = e.message; err.hidden = false; }
+  }));
+  const btnTfaEnable = document.getElementById('btn-tfa-enable');
+  if (btnTfaEnable) btnTfaEnable.addEventListener('click', tfaEnable);
+  const btnTfaDisable = document.getElementById('btn-tfa-disable');
+  if (btnTfaDisable) btnTfaDisable.addEventListener('click', tfaDisable);
   const versionsCancel = document.getElementById('versions-cancel');
   if (versionsCancel) versionsCancel.addEventListener('click', closeVersions);
 

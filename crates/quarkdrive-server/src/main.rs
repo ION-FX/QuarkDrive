@@ -15,6 +15,7 @@
 mod api;
 mod db;
 mod media;
+mod totp;
 mod vault;
 
 use anyhow::{Context, Result};

@@ -43,6 +43,10 @@ the actual egui frames into PNGs so the screenshots show the real UI:
 ./scripts/test-gui.sh          # screenshots in /tmp/qd-gui-shots/
 ```
 
+> Note: the native GUI and the web UI both support two-factor sign-in
+> (you are prompted for a six-digit code after your password). The PyQt6
+> client predates 2FA and cannot complete such a sign-in yet.
+
 ## qd-gui.py — PyQt6 alternative
 
 Same feature set with drag-and-drop and Qt's native dialogs, for machines

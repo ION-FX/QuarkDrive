@@ -347,6 +347,117 @@ case "$(curl -s "$SRV/s/$PLINK_ID")" in
   *) fail "/s/<id> did not serve the visitor page";;
 esac
 
+echo "== TOTP two-factor =="
+# Enroll with a known secret so codes can be computed both here and there.
+TOTP_SECRET=$(curl -s -X POST "${auth[@]}" "$SRV/api/v1/auth/totp/setup" | python3 -c "
+import json,sys; print(json.load(sys.stdin)['secret'])")
+CODE1=$(python3 -c "
+import hmac, hashlib, struct, base64, time
+key = base64.b32decode('$TOTP_SECRET')
+c = int(time.time() // 30)
+d = hmac.new(key, struct.pack('>Q', c), hashlib.sha1).digest()
+o = d[19] & 0x0f
+print((struct.unpack('>I', d[o:o+4])[0] & 0x7fffffff) % 1000000)")
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X POST "${auth[@]}" "$SRV/api/v1/auth/totp/enable" \
+  -H 'content-type: application/json' -d "{\"code\":\"$CODE1\"}")" \
+  "200" "enrollment confirms with a live code"
+expect "$(curl -s "${auth[@]}" "$SRV/api/v1/auth/totp" | grep -o true)" "true" "two-factor now enabled"
+
+LOGIN=$(curl -s -X POST "$SRV/api/v1/auth/login" -H 'content-type: application/json' \
+  -d '{"username":"ada","password":"hunter22"}')
+expect "$(printf '%s' "$LOGIN" | python3 -c "import json,sys; print(json.load(sys.stdin).get('totp_required',''))")" \
+  "True" "login with 2FA asks for a code"
+PENDING=$(printf '%s' "$LOGIN" | python3 -c "import json,sys; print(json.load(sys.stdin)['pending'])")
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$SRV/api/v1/auth/login/totp" \
+  -H 'content-type: application/json' \
+  -d "{\"username\":\"ada\",\"pending\":\"$PENDING\",\"code\":\"000000\"}")" \
+  "401" "a wrong code is refused"
+CODE2=$(python3 -c "
+import hmac, hashlib, struct, base64, time
+key = base64.b32decode('$TOTP_SECRET')
+c = int(time.time() // 30)
+d = hmac.new(key, struct.pack('>Q', c), hashlib.sha1).digest()
+o = d[19] & 0x0f
+print((struct.unpack('>I', d[o:o+4])[0] & 0x7fffffff) % 1000000)")
+TOTP_TOKEN=$(curl -s -X POST "$SRV/api/v1/auth/login/totp" -H 'content-type: application/json' \
+  -d "{\"username\":\"ada\",\"pending\":\"$PENDING\",\"code\":\"$CODE2\"}" | python3 -c "
+import json,sys; print(json.load(sys.stdin).get('token',''))")
+if [[ -n "$TOTP_TOKEN" ]]; then
+  pass "the right code completes the sign-in"
+else
+  fail "totp sign-in did not issue a token"
+fi
+expect "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOTP_TOKEN" "$SRV/api/v1/whoami")" \
+  "200" "the 2FA-issued token authenticates"
+expect "$(curl -s -o /dev/null -w '%{http_code}' "$SRV/api/v1/auth/totp" -H "Authorization: Bearer $PENDING")" \
+  "401" "a pending id is not a session token"
+
+# Turn 2FA back off with a live code, restoring the suite's assumptions.
+CODE3=$(python3 -c "
+import hmac, hashlib, struct, base64, time
+key = base64.b32decode('$TOTP_SECRET')
+c = int(time.time() // 30)
+d = hmac.new(key, struct.pack('>Q', c), hashlib.sha1).digest()
+o = d[19] & 0x0f
+print((struct.unpack('>I', d[o:o+4])[0] & 0x7fffffff) % 1000000)")
+curl -sf -X POST "${auth[@]}" "$SRV/api/v1/auth/totp/disable" \
+  -H 'content-type: application/json' -d "{\"code\":\"$CODE3\"}" >/dev/null
+expect "$(curl -s "${auth[@]}" "$SRV/api/v1/auth/totp" | grep -o true)" "" "two-factor disabled again"
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$SRV/api/v1/auth/login" \
+  -H 'content-type: application/json' -d '{"username":"ada","password":"hunter22"}' -o /dev/null -w '%{http_code}')" \
+  "200" "plain password login works after disabling"
+
+echo "== resumable uploads =="
+python3 -c "open('$WORK/big.bin','wb').write(bytes(i % 256 for i in range(1000)))"
+head -c 400 "$WORK/big.bin" > "$WORK/c1"; tail -c 600 "$WORK/big.bin" > "$WORK/c2"
+SESSION=$(curl -s -X POST "${auth[@]}" "$SRV/api/v1/vaults/photos/fs/resume" \
+  -H 'content-type: application/json' -d '{"path":"big.bin","size":1000}' | python3 -c "
+import json,sys; print(json.load(sys.stdin)['session'])")
+if [[ -n "$SESSION" ]]; then pass "upload session created"; else fail "no upload session"; fi
+
+curl -sf -X PUT "${auth[@]}" --data-binary @"$WORK/c1" \
+  "$SRV/api/v1/vaults/photos/fs/resume/$SESSION?offset=0" >/dev/null
+pass "first chunk stored"
+
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${auth[@]}" --data-binary @"$WORK/c1" \
+  "$SRV/api/v1/vaults/photos/fs/resume/$SESSION?offset=0")" \
+  "409" "a replayed chunk is refused"
+expect "$(curl -s -X PUT "${auth[@]}" --data-binary @"$WORK/c1" \
+  "$SRV/api/v1/vaults/photos/fs/resume/$SESSION?offset=0" | python3 -c "
+import json,sys; print(json.load(sys.stdin).get('received',''))")" \
+  "400" "the refusal names the server's true offset"
+
+expect "$(curl -s "${auth[@]}" "$SRV/api/v1/vaults/photos/fs/resume/$SESSION" | python3 -c "
+import json,sys; print(json.load(sys.stdin)['received'])")" \
+  "400" "status query reports progress for resuming"
+
+curl -sf -X PUT "${auth[@]}" --data-binary @"$WORK/c2" \
+  "$SRV/api/v1/vaults/photos/fs/resume/$SESSION?offset=400" >/dev/null
+curl -sf -X POST "${auth[@]}" "$SRV/api/v1/vaults/photos/fs/resume/$SESSION/finish" >/dev/null
+curl -s "${auth[@]}" "$SRV/api/v1/vaults/photos/fs/download?path=big.bin" > "$WORK/big-down.bin"
+if cmp -s "$WORK/big.bin" "$WORK/big-down.bin"; then
+  pass "chunked upload reassembles byte-identically"
+else
+  fail "reassembled file differs"
+fi
+
+# An incomplete finish is refused, and cancelling cleans up.
+SESSION2=$(curl -s -X POST "${auth[@]}" "$SRV/api/v1/vaults/photos/fs/resume" \
+  -H 'content-type: application/json' -d '{"path":"x.bin","size":100}' | python3 -c "
+import json,sys; print(json.load(sys.stdin)['session'])")
+curl -sf -X PUT "${auth[@]}" --data-binary 'partial' \
+  "$SRV/api/v1/vaults/photos/fs/resume/$SESSION2?offset=0" >/dev/null
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X POST "${auth[@]}" \
+  "$SRV/api/v1/vaults/photos/fs/resume/$SESSION2/finish")" \
+  "400" "an incomplete upload cannot be finished"
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "${auth[@]}" \
+  "$SRV/api/v1/vaults/photos/fs/resume/$SESSION2")" \
+  "200" "cancelling an upload session works"
+expect "$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" \
+  "$SRV/api/v1/vaults/photos/fs/resume/$SESSION2")" \
+  "404" "the cancelled session is gone"
+expect "$(ls "$DATA/uploads" 2>/dev/null | wc -l)" "0" "no leftover part files"
+
 echo "== login rate limiting =="
 for i in 1 2 3 4 5 6; do
   code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$SRV/api/v1/auth/login" \

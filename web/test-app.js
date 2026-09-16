@@ -101,7 +101,7 @@ function makeStorage() {
   };
 }
 
-function makeFetch(calls, { firstRun, shareRole = 'owner' }) {
+function makeFetch(calls, { firstRun, shareRole = 'owner', totp = false, totpEnabled = false }) {
   return function fetch(url) {
     url = String(url);
     calls.push(url);
@@ -124,7 +124,16 @@ function makeFetch(calls, { firstRun, shareRole = 'owner' }) {
         ],
       };
     } else if (url.includes('/auth/status')) body = { first_run: firstRun };
-    else if (url.includes('/auth/login')) body = { token: 'tok-login', user_id: 'u1' };
+    else if (url.includes('/auth/login/totp')) body = { token: 'tok-totp', user_id: 'u1' };
+    else if (url.includes('/auth/totp/setup')) {
+      body = { secret: 'SECRETCODE32', otpauth: 'otpauth://totp/Quarkdrive:ada' };
+    } else if (url.includes('/auth/totp')) {
+      body = /enable|disable/.test(url) ? { ok: true } : { enabled: totpEnabled };
+    } else if (url.includes('/auth/login')) {
+      body = totp
+        ? { totp_required: true, pending: 'pen1' }
+        : { token: 'tok-login', user_id: 'u1' };
+    }
     else if (url.includes('/auth/register')) body = { token: 'tok-reg', user_id: 'u2', vault: 'myvault' };
     else if (url.includes('/whoami')) body = { user: 'ada' };
     else if (url.includes('/timeline')) body = { items: [] };
@@ -163,7 +172,13 @@ function makeFetch(calls, { firstRun, shareRole = 'owner' }) {
   };
 }
 
-async function boot({ includeSignup = true, firstRun = false, shareRole = 'owner' } = {}) {
+async function boot({
+  includeSignup = true,
+  firstRun = false,
+  shareRole = 'owner',
+  totp = false,
+  totpEnabled = false,
+} = {}) {
   const calls = [];
   const dom = makeDom({ includeSignup });
   const storage = makeStorage();
@@ -192,8 +207,8 @@ async function boot({ includeSignup = true, firstRun = false, shareRole = 'owner
 
   const run = (source) => new Function(
     'window', 'document', 'localStorage', 'fetch', 'URL', 'QuarkdriveThemes', source,
-  )(windowStub, documentStub, storage, makeFetch(calls, { firstRun, shareRole }), URLStub,
-    windowStub.QuarkdriveThemes);
+  )(windowStub, documentStub, storage, makeFetch(calls, { firstRun, shareRole, totp, totpEnabled }),
+    URLStub, windowStub.QuarkdriveThemes);
 
   run(themesSource); // themes.js first, as index.html loads it
   run(appSource);
@@ -462,6 +477,67 @@ async function main() {
     check('restore hits the versions restore endpoint',
       calls.some((u) => u.includes('/fs/versions/restore')));
     check('modal closes after restoring', dom.byId('#versions-modal').hidden === true);
+  }
+
+  section('two-factor sign-in: code step between password and session');
+
+  {
+    const { dom, calls, storage } = await boot({
+      includeSignup: true,
+      firstRun: false,
+      totp: true,
+    });
+    dom.byId('#login-server').value = 'http://srv:8787';
+    dom.byId('#login-username').value = 'ada';
+    dom.byId('#login-password').value = 'hunter22';
+    dom.byId('#login-form').fire('submit');
+    await tick(); await tick();
+    check('the code field appears after the password',
+      dom.byId('#totp-fields').hidden === false);
+    check('no session token is stored yet',
+      storage.getItem('qd.token') === null);
+    check('the app is still on the login view',
+      dom.byId('#login-view').hidden === false);
+
+    dom.byId('#login-totp').value = '123456';
+    dom.byId('#login-form').fire('submit');
+    await tick(); await tick();
+    check('the code was sent to the totp endpoint',
+      calls.some((u) => u.includes('/auth/login/totp')));
+    check('the token from the code is stored',
+      storage.getItem('qd.token') === 'tok-totp');
+  }
+
+  section('two-factor drawer: setup, enable');
+
+  {
+    const { dom, calls } = await boot({
+      includeSignup: true,
+      firstRun: false,
+      totpEnabled: false,
+    });
+    dom.byId('#login-server').value = 'http://srv:8787';
+    dom.byId('#login-username').value = 'ada';
+    dom.byId('#login-password').value = 'hunter22';
+    dom.byId('#login-form').fire('submit');
+    await tick(); await tick();
+
+    dom.byId('#btn-2fa').fire('click');
+    await tick(); await tick();
+    check('the 2FA drawer opens', dom.byId('#tfa-drawer').hidden === false);
+    check('status was fetched', calls.some((u) => u.includes('/auth/totp')));
+
+    dom.byId('#btn-tfa-setup').fire('click');
+    await tick(); await tick();
+    check('the secret is shown for the authenticator app',
+      (dom.byId('#tfa-secret').textContent || '').includes('SECRETCODE32'));
+
+    dom.byId('#tfa-code').value = '123456';
+    dom.byId('#btn-tfa-enable').fire('click');
+    await tick(); await tick();
+    check('enable posts the code', calls.some((u) => u.includes('/auth/totp/enable')));
+    check('the drawer flips to the enabled state',
+      dom.byId('#tfa-disable').hidden === false);
   }
 
   section('a read-only share hides the share button');

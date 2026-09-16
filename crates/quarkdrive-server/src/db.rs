@@ -18,7 +18,9 @@ CREATE TABLE IF NOT EXISTS users (
     username  TEXT NOT NULL UNIQUE,
     pass_hash TEXT NOT NULL,
     pass_salt TEXT NOT NULL,
-    created   INTEGER NOT NULL
+    created   INTEGER NOT NULL,
+    totp_secret TEXT,
+    totp_enabled INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS tokens (
     token   TEXT PRIMARY KEY,
@@ -62,8 +64,34 @@ CREATE TABLE IF NOT EXISTS links (
 );
 CREATE INDEX IF NOT EXISTS idx_shares_user ON shares(user_id);
 CREATE INDEX IF NOT EXISTS idx_trash_vault ON trash(vault_id);
+CREATE TABLE IF NOT EXISTS uploads (
+    session  TEXT PRIMARY KEY,
+    vault_id TEXT NOT NULL,
+    path     TEXT NOT NULL,
+    size     INTEGER NOT NULL,
+    received INTEGER NOT NULL DEFAULT 0,
+    created  INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_links_vault ON links(vault_id);
+CREATE INDEX IF NOT EXISTS idx_uploads_created ON uploads(created);
 "#;
+
+/// Add `column` to `table` if an older database lacks it.
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> Result<()> {
+    let exists: bool = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .any(|c| c.as_deref() == Ok(column));
+    if !exists {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct VaultRow {
@@ -92,6 +120,18 @@ pub struct ShareRow {
     pub user_id: String,
     pub username: String,
     pub role: String,
+    pub created: i64,
+}
+
+/// An in-progress chunked upload.
+#[derive(Debug, Clone)]
+pub struct UploadRow {
+    pub session: String,
+    pub vault_id: String,
+    pub path: String,
+    pub size: u64,
+    pub received: u64,
+    #[allow(dead_code)]
     pub created: i64,
 }
 
@@ -128,6 +168,10 @@ impl Db {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        // Columns added after the first release: CREATE TABLE IF NOT EXISTS
+        // will not add them to an existing database.
+        ensure_column(&conn, "users", "totp_secret", "TEXT")?;
+        ensure_column(&conn, "users", "totp_enabled", "INTEGER NOT NULL DEFAULT 0")?;
         conn.pragma_update(None, "journal_mode", &"WAL")?;
         Ok(Db {
             conn: Mutex::new(conn),
@@ -146,6 +190,63 @@ impl Db {
         let mut buf = vec![0u8; bytes];
         rand::thread_rng().fill_bytes(&mut buf);
         hex::encode(&buf)
+    }
+
+    /// Identifier for a half-finished 2FA login.
+    pub fn pending_id() -> String {
+        Self::random_id(16)
+    }
+
+    // -------------------------------------------------------- uploads
+
+    pub fn create_upload(&self, vault_id: &str, path: &str, size: u64) -> Result<String> {
+        let session = Self::random_id(16);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO uploads (session, vault_id, path, size, received, created)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+            params![session, vault_id, path, size as i64, Self::now()],
+        )?;
+        Ok(session)
+    }
+
+    pub fn upload_get(&self, session: &str) -> Result<Option<UploadRow>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn.query_row(
+            "SELECT session, vault_id, path, size, received, created
+             FROM uploads WHERE session = ?1",
+            params![session],
+            |r| {
+                Ok(UploadRow {
+                    session: r.get(0)?,
+                    vault_id: r.get(1)?,
+                    path: r.get(2)?,
+                    size: r.get::<_, i64>(3)? as u64,
+                    received: r.get::<_, i64>(4)? as u64,
+                    created: r.get(5)?,
+                })
+            },
+        );
+        match row {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn upload_record_bytes(&self, session: &str, n: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE uploads SET received = received + ?1 WHERE session = ?2",
+            params![n as i64, session],
+        )?;
+        Ok(())
+    }
+
+    pub fn upload_delete(&self, session: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("DELETE FROM uploads WHERE session = ?1", params![session])?;
+        Ok(n > 0)
     }
 
     pub fn count_users(&self) -> Result<i64> {
@@ -335,6 +436,58 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute("DELETE FROM tokens WHERE token = ?1", params![token])?;
         Ok(n > 0)
+    }
+
+    // ------------------------------------------------------- two-factor
+
+    /// Store a generated secret without enabling it yet: the user must
+    /// confirm a working code first, or a lost phone could lock them out
+    /// on a half-finished setup.
+    pub fn set_totp_secret(&self, user_id: &str, secret_b32: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE users SET totp_secret = ?1, totp_enabled = 0 WHERE id = ?2",
+            params![secret_b32, user_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn enable_totp(&self, user_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE users SET totp_enabled = 1 WHERE id = ?1 AND totp_secret IS NOT NULL",
+            params![user_id],
+        )?;
+        Ok(())
+    }
+
+    /// Turning 2FA off clears the secret entirely.
+    pub fn disable_totp(&self, user_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE users SET totp_secret = NULL, totp_enabled = 0 WHERE id = ?1",
+            params![user_id],
+        )?;
+        Ok(())
+    }
+
+    /// (secret, enabled) — None when the user never enrolled.
+    pub fn totp_for_user(&self, user_id: &str) -> Result<Option<(String, bool)>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn.query_row(
+            "SELECT totp_secret, totp_enabled FROM users WHERE id = ?1",
+            params![user_id],
+            |r| {
+                let secret: Option<String> = r.get(0)?;
+                let enabled: i64 = r.get(1)?;
+                Ok(secret.map(|s| (s, enabled != 0)))
+            },
+        );
+        match row {
+            Ok(v) => Ok(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     // ---------------------------------------------------------------- vaults
@@ -740,6 +893,59 @@ mod tests {
         assert!(db.create_vault("../escape", &a, false).is_err());
         assert!(db.create_vault("a/b", &a, false).is_err());
         assert!(db.create_vault("", &a, false).is_err());
+    }
+
+    #[test]
+    fn upload_sessions_track_progress() {
+        let (_d, db) = db("db-uploads");
+        let owner = db.create_user("a", "pw").unwrap();
+        let vault = db.create_vault("v", &owner, false).unwrap();
+
+        let session = db.create_upload(&vault, "movies/big.bin", 1000).unwrap();
+        let row = db.upload_get(&session).unwrap().unwrap();
+        assert_eq!(row.received, 0);
+        assert_eq!(row.size, 1000);
+        assert_eq!(row.path, "movies/big.bin");
+
+        db.upload_record_bytes(&session, 400).unwrap();
+        db.upload_record_bytes(&session, 600).unwrap();
+        assert_eq!(db.upload_get(&session).unwrap().unwrap().received, 1000);
+
+        assert!(db.upload_delete(&session).unwrap());
+        assert!(db.upload_get(&session).unwrap().is_none());
+        assert!(db.upload_get("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn totp_enrollment_requires_confirmation() {
+        let (_d, db) = db("db-totp");
+        let uid = db.create_user("ada", "pw").unwrap();
+        assert!(db.totp_for_user(&uid).unwrap().is_none());
+
+        db.set_totp_secret(&uid, "MZXW6YTB").unwrap();
+        // A stored-but-unconfirmed secret is not yet second factor.
+        assert_eq!(
+            db.totp_for_user(&uid).unwrap(),
+            Some(("MZXW6YTB".to_string(), false))
+        );
+
+        db.enable_totp(&uid).unwrap();
+        assert_eq!(
+            db.totp_for_user(&uid).unwrap(),
+            Some(("MZXW6YTB".to_string(), true))
+        );
+
+        // Disabling clears everything, including the old secret.
+        db.disable_totp(&uid).unwrap();
+        assert_eq!(db.totp_for_user(&uid).unwrap(), None);
+    }
+
+    #[test]
+    fn enabling_without_a_secret_changes_nothing() {
+        let (_d, db) = db("db-totp-enable");
+        let uid = db.create_user("a", "pw").unwrap();
+        db.enable_totp(&uid).unwrap();
+        assert!(db.totp_for_user(&uid).unwrap().is_none());
     }
 
     #[test]

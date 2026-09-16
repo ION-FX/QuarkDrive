@@ -117,6 +117,27 @@ pointer. Because storage is content-addressed, a restore never copies
 anything. One honest limit: purging is not a secure erase; the chunks stay
 on disk until object-level garbage collection exists.
 
+## Two-factor sign-in
+
+From the 🔒 button: generate a secret, add it to any authenticator app
+(Aegis, 1Password, Google Authenticator — anything that speaks TOTP), and
+confirm one live code. Afterwards a password alone is not enough: the
+server hands out a five-minute pending id that only a valid code can
+exchange for a real token, and failed attempts feed the same brute-force
+limiter as passwords do. Codes are accepted one step either side of now,
+for phone clocks that drift. Disabling demands a live code, so a stolen
+open session cannot quietly switch 2FA off. Enrollment is deliberately
+two-step — a secret that was generated but never confirmed does not lock
+anyone out.
+
+## Resumable uploads
+
+`POST /fs/resume` opens a session, chunks go up with `PUT …?offset=N`
+(the server answers 409 with its true offset if one is lost), `GET`
+reports progress, `POST …/finish` assembles the file — and its size is
+verified against the declared total before anything is stored. The web UI
+switches to this automatically for files over 8 MB.
+
 ## Public links and version history
 
 The share drawer's *Public links* section publishes the folder you are

@@ -36,6 +36,8 @@ pub enum Listing {
 pub enum Event {
     FirstRun(Result<bool, String>),
     LoggedIn(Result<(String, Vec<VaultInfo>), String>), // (token, vaults)
+    /// The password was right; a 2FA code is still wanted.
+    TotpRequired(String),
     Listed(Result<Vec<Entry>, String>),
     Stats(Result<Stats, String>),
     Uploaded(Result<String, String>),
@@ -118,6 +120,9 @@ pub struct App {
     pub login_err: Option<String>,
     /// Guards against re-asking /auth/status every frame.
     pub status_checked: bool,
+    /// Pending 2FA challenge id + the code being typed.
+    pub pending_totp: Option<String>,
+    pub totp_buf: String,
 
     // --------------------------------------------------------- session
     pub api: Option<Api>,
@@ -178,6 +183,8 @@ impl App {
             signup_hint: None,
             login_err: None,
             status_checked: false,
+            pending_totp: None,
+            totp_buf: String::new(),
             api: None,
             vaults: Vec::new(),
             vault: None,
@@ -224,6 +231,10 @@ impl App {
 
     fn handle(&mut self, ev: Event) {
         match ev {
+            Event::TotpRequired(pending) => {
+                self.pending_totp = Some(pending);
+                self.login_err = Some("enter the code from your authenticator".into());
+            }
             Event::FirstRun(res) => match res {
                 Ok(first) => {
                     self.signup_hint = Some(first);
@@ -407,9 +418,14 @@ impl App {
         self.spawn(move || Event::FirstRun(api::Api::first_run(&server)));
     }
 
-    /// The login card's primary button: sign in, or sign up on first run.
+    /// The login card's primary button: verify a 2FA code, sign in, or
+    /// sign up on first run.
     pub fn primary(&mut self) {
         if self.busy > 0 {
+            return;
+        }
+        if self.pending_totp.is_some() {
+            self.sign_in_totp();
             return;
         }
         match self.signup_hint {
@@ -423,6 +439,21 @@ impl App {
         let (server, user, pass) =
             (self.server.clone(), self.username.clone(), self.password.clone());
         self.spawn(move || match Api::login(&server, &user, &pass) {
+            Ok(api::LoginOutcome::Token(token)) => Self::fetch_session_static(&server, &token),
+            Ok(api::LoginOutcome::TotpRequired(pending)) => Event::TotpRequired(pending),
+            Err(e) => Event::LoggedIn(Err(e)),
+        });
+    }
+
+    /// Second half of a 2FA sign-in.
+    pub fn sign_in_totp(&mut self) {
+        let Some(pending) = self.pending_totp.clone() else { return };
+        let code = self.totp_buf.trim().to_string();
+        if code.is_empty() {
+            return;
+        }
+        let (server, user) = (self.server.clone(), self.username.clone());
+        self.spawn(move || match Api::login_totp(&server, &user, &pending, &code) {
             Ok((token, _)) => Self::fetch_session_static(&server, &token),
             Err(e) => Event::LoggedIn(Err(e)),
         });
@@ -470,6 +501,8 @@ impl App {
         self.listing = Listing::Dir;
         self.selected = None;
         self.signup_hint = None;
+        self.pending_totp = None;
+        self.totp_buf.clear();
         self.tab = Tab::Files;
         self.note = Some((false, "signed out".into()));
     }
