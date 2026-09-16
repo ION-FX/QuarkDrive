@@ -17,6 +17,7 @@ mod db;
 mod media;
 mod totp;
 mod vault;
+mod webdav;
 
 use anyhow::{Context, Result};
 use axum::body::Body;

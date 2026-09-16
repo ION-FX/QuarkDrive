@@ -8,6 +8,11 @@ One vault, three kinds of client:
 - **Web** — a browser UI for browsing, uploading and viewing photos
 - **Android** — automatic camera backup plus browsing
 
+A vault also **mounts as a drive**: every vault is served over WebDAV at
+`/dav/<vault>`, so GNOME Files, Dolphin, davfs2 or rclone can work with
+your files natively — drag, drop, edit, save — with deletions landing in
+the trash like everywhere else.
+
 And the things that make it a place rather than a folder: **share a vault**
 with another account on the server (view or edit), a **trash** that keeps
 deleted files until they are purged, optional native **HTTPS**, and a login
@@ -122,6 +127,23 @@ Version history has bounded retention — the last ten snapshots — so old
 states age out, which is what lets a purge eventually erase content the
 history once referenced. Purged bytes disappear from version history the
 same way.
+
+## Mounting a vault (WebDAV)
+
+```sh
+# GNOME Files / Dolphin:  dav://your-server:8787/photos
+# KDE:                    webdav://your-server:8787/photos
+rclone ls :http:url=http://your-server:8787/photos,vendor=other --user ada --pass '…'
+mount -t davfs2 http://your-server:8787/photos /mnt/photos   # davfs2
+```
+
+Sign in with your normal username and password. Your role applies: a
+read-only share mounts read-only, and a file deleted from the mount goes
+to the trash, recoverable from the web UI. Two limits, honestly: HTTP
+Basic authentication is per-request, so it is only as safe as the
+transport — mount over HTTPS or a trusted LAN; and accounts with
+two-factor enabled cannot use WebDAV yet (the password alone is not
+enough by design; an app-password feature is the planned answer).
 
 ## Two-factor sign-in
 

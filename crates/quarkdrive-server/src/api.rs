@@ -193,6 +193,61 @@ impl LoginLimiter {
     }
 }
 
+/// CORS for the JSON API only. WebDAV's OPTIONS verb is part of the
+/// protocol, and tower-http's CORS layer answers every OPTIONS itself —
+/// so the DAV mount point must stay outside its reach.
+#[derive(Clone)]
+struct ApiOnlyCors;
+
+impl<S> tower::Layer<S> for ApiOnlyCors
+where
+    S: Clone
+        + tower::Service<axum::extract::Request, Response = axum::response::Response>
+        + Send
+        + 'static,
+    S::Future: Send,
+{
+    type Service = ApiOnlyCorsService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        let cors = CorsLayer::permissive().layer(inner.clone());
+        ApiOnlyCorsService { inner, cors }
+    }
+}
+
+#[derive(Clone)]
+struct ApiOnlyCorsService<S> {
+    inner: S,
+    cors: tower_http::cors::Cors<S>,
+}
+
+impl<S> tower::Service<axum::extract::Request> for ApiOnlyCorsService<S>
+where
+    S: tower::Service<axum::extract::Request, Response = axum::response::Response> + Send + 'static,
+    S::Future: Send,
+{
+    type Response = axum::response::Response;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, S::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        tower::Service::poll_ready(&mut self.inner, cx)
+    }
+
+    fn call(&mut self, req: axum::extract::Request) -> Self::Future {
+        if req.uri().path().starts_with("/api") {
+            Box::pin(self.cors.call(req))
+        } else {
+            Box::pin(tower::Service::call(&mut self.inner, req))
+        }
+    }
+}
+
 // ------------------------------------------------------------------- errors
 
 pub struct ApiError {
@@ -2079,6 +2134,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/public/:id", get(public_meta))
         .route("/api/v1/public/:id/list", get(public_list))
         .route("/api/v1/public/:id/download", get(public_download))
+        // WebDAV: native file managers mount a vault here. Collections are
+        // addressed with a trailing slash, which axum treats as its own
+        // route — file managers always send the slash, so both exist.
+        .route("/dav/:vault", any(crate::webdav::handle_root))
+        .route("/dav/:vault/", any(crate::webdav::handle_root))
+        .route("/dav/:vault/*rest", any(crate::webdav::handle))
         .route("/api/v1/vaults/:vault/fs/resume", post(upload_start))
         .route(
             "/api/v1/vaults/:vault/fs/resume/:session",
@@ -2115,7 +2176,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api", any(api_not_found))
         .route("/api/*rest", any(api_not_found))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
-        .layer(CorsLayer::permissive())
+        // CORS for the JSON API only. WebDAV's OPTIONS verb is part of the
+        // protocol, and tower-http's CORS layer answers every OPTIONS
+        // itself — so the DAV mount point must stay outside its reach.
+        .layer(ApiOnlyCors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

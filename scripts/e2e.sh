@@ -527,6 +527,83 @@ curl -sf -X POST "${auth[@]}" "$SRV/api/v1/vaults/photos/trash/restore?id=$KEEP_
 expect "$(curl -s "${auth[@]}" "$SRV/api/v1/vaults/photos/fs/download?path=gc/keep.txt")" \
   "restorable" "trash without purge still restores"
 
+echo "== WebDAV =="
+DAV="$SRV/dav/photos"
+CREDS="ada:hunter22"
+
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X OPTIONS -u "$CREDS" "$DAV/")" \
+  "200" "OPTIONS answers on the mount point"
+dav_header=$(curl -s -X OPTIONS -u "$CREDS" "$DAV/" -D- -o /dev/null | grep -i '^dav:' | tr -d '\r' | cut -d' ' -f2)
+case "$dav_header" in
+  1*) pass "advertises DAV compliance ($dav_header)";;
+  *) fail "no DAV header: '$dav_header'";;
+esac
+
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X PROPFIND "$DAV/")" \
+  "401" "WebDAV needs basic auth"
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X PROPFIND -u 'ada:wrong' "$DAV/")" \
+  "401" "wrong password refused"
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X PROPFIND -u "$CREDS" "$DAV/")" \
+  "207" "PROPFIND lists the vault"
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X PROPFIND -u "$CREDS" "$DAV/never-existed")" \
+  "404" "PROPFIND on a missing path is a 404"
+
+curl -sf -X MKCOL -u "$CREDS" "$DAV/webdav-dir/" >/dev/null
+pass "MKCOL creates a folder"
+echo "written over webdav" > "$WORK/davfile.txt"
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -u "$CREDS" \
+  --data-binary @"$WORK/davfile.txt" "$DAV/webdav-dir/davfile.txt")" \
+  "201" "PUT creates a file"
+expect "$(curl -s -u "$CREDS" "$DAV/webdav-dir/davfile.txt")" \
+  "written over webdav" "GET returns the exact bytes"
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -u "$CREDS" \
+  --data-binary @"$WORK/davfile.txt" "$DAV/webdav-dir/davfile.txt")" \
+  "204" "PUT over an existing file is a 204"
+
+listing=$(curl -s -X PROPFIND -u "$CREDS" -H "Depth: 1" "$DAV/webdav-dir/")
+case "$listing" in
+  *davfile.txt*) pass "PROPFIND depth 1 lists the uploaded file";;
+  *) fail "PROPFIND did not list the file: $listing";;
+esac
+case "$listing" in
+  *"<D:collection/>"*) pass "collections are marked as collections";;
+  *) fail "no collection markers in PROPFIND";;
+esac
+
+curl -sf -X MOVE -u "$CREDS" -H "Destination: $DAV/webdav-dir/renamed.txt" \
+  "$DAV/webdav-dir/davfile.txt" >/dev/null
+expect "$(curl -s -u "$CREDS" "$DAV/webdav-dir/renamed.txt")" \
+  "written over webdav" "MOVE renames, content intact"
+expect "$(curl -s -o /dev/null -w '%{http_code}' -u "$CREDS" "$DAV/webdav-dir/davfile.txt")" \
+  "404" "the old name is gone after MOVE"
+curl -sf -X COPY -u "$CREDS" -H "Destination: $DAV/webdav-dir/copy.txt" \
+  "$DAV/webdav-dir/renamed.txt" >/dev/null
+expect "$(curl -s -u "$CREDS" "$DAV/webdav-dir/copy.txt")" \
+  "written over webdav" "COPY duplicates the content"
+
+curl -sf -X DELETE -u "$CREDS" "$DAV/webdav-dir/copy.txt" >/dev/null
+IN_TRASH=$(curl -s "${auth[@]}" "$SRV/api/v1/vaults/photos/trash" | python3 -c "
+import json,sys
+items=[i for i in json.load(sys.stdin)['items'] if i['path']=='webdav-dir/copy.txt']
+print('yes' if items else 'no')")
+expect "$IN_TRASH" "yes" "a WebDAV delete lands in the trash like the web UI"
+
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -u 'carol:singer-8' \
+  --data-binary no "$DAV/webdav-dir/no.txt")" \
+  "403" "read-only sharee cannot write over WebDAV"
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X PROPFIND -u 'carol:singer-8' \
+  -H 'Depth: 1' "$DAV/")" \
+  "207" "read-only sharee can browse over WebDAV"
+
+LOCK_XML=$(curl -s -X LOCK -u "$CREDS" "$DAV/webdav-dir/renamed.txt")
+case "$LOCK_XML" in
+  *opaquelocktoken:*) pass "LOCK grants a lock token";;
+  *) fail "LOCK did not grant a token: $LOCK_XML";;
+esac
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X UNLOCK -u "$CREDS" \
+  "$DAV/webdav-dir/renamed.txt")" \
+  "204" "UNLOCK clears the lock"
+
 echo "== login rate limiting =="
 for i in 1 2 3 4 5 6; do
   code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$SRV/api/v1/auth/login" \
