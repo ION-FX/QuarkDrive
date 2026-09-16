@@ -162,6 +162,22 @@ try {
 
     <ul id="share-list" class="entry-list" style="margin-top:12px"></ul>
 
+    <div class="drawer-section">
+      <h3>Public links</h3>
+      <p class="hint" style="margin:0 0 8px">
+        Anyone with the link can view and download this folder — no account
+        needed. Links can have a password and an expiry.
+      </p>
+      <div class="drawer-row">
+        <input id="link-password" type="password" placeholder="Optional password"
+               autocomplete="new-password" style="flex:1">
+        <button id="btn-create-link" class="primary">Link this folder</button>
+      </div>
+      <p class="hint" style="margin:4px 0 0">The link covers the folder you are
+        currently browsing: <span id="link-cwd" class="mono"></span></p>
+      <ul id="link-list" class="entry-list" style="margin-top:12px"></ul>
+    </div>
+
     <p class="hint">
       People you invite see the vault in their own list. Only the owner can
       manage shares, and end-to-end encrypted vaults cannot be shared — the
@@ -246,6 +262,23 @@ try {
       <button id="te-delete" class="danger" hidden>Delete</button>
       <button id="te-cancel" class="ghost">Cancel</button>
       <button id="te-save" class="primary">Save &amp; use</button>
+    </div>
+  </div>
+</div>
+
+<!-- ------------------------------------------------- versions modal -->
+<div id="versions-modal" class="modal" hidden role="dialog" aria-modal="true" aria-label="Version history">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2 id="versions-title">Versions</h2>
+      <button id="versions-close" class="icon-btn" aria-label="Close versions">✕</button>
+    </div>
+    <p class="hint">Every distinct content this file has had, newest first.
+      Restoring puts an old version back; nothing is lost.</p>
+    <ul id="versions-list" class="entry-list"></ul>
+    <p id="versions-error" class="error" role="alert" hidden></p>
+    <div class="modal-actions">
+      <button id="versions-cancel" class="ghost">Close</button>
     </div>
   </div>
 </div>

@@ -219,6 +219,11 @@ async fn serve(
     // browser may heuristically serve a stale index.html against a newer
     // app.js, and mixed UI versions fail silently.
     let app = api::router(state)
+        // /s/<id> is a public share link: same SPA styles, no session.
+        .route(
+            "/s/:id",
+            axum::routing::get_service(ServeFile::new(web_dir.join("public.html"))),
+        )
         .fallback_service(ServeDir::new(&web_dir).fallback(ServeFile::new(index)))
         .layer(SetResponseHeaderLayer::overriding(
             CACHE_CONTROL,

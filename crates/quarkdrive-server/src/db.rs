@@ -51,8 +51,18 @@ CREATE TABLE IF NOT EXISTS trash (
 );
 CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_vaults_owner ON vaults(owner_id);
+CREATE TABLE IF NOT EXISTS links (
+    id       TEXT PRIMARY KEY,     -- the public token that appears in the URL
+    vault_id TEXT NOT NULL,
+    path     TEXT NOT NULL,        -- shared file, or the root of a shared folder
+    pass_hash TEXT,                -- Argon2id of the link password, if any
+    pass_salt TEXT,
+    expires  INTEGER,              -- unix seconds; null = never
+    created  INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_shares_user ON shares(user_id);
 CREATE INDEX IF NOT EXISTS idx_trash_vault ON trash(vault_id);
+CREATE INDEX IF NOT EXISTS idx_links_vault ON links(vault_id);
 "#;
 
 #[derive(Debug, Clone)]
@@ -83,6 +93,28 @@ pub struct ShareRow {
     pub username: String,
     pub role: String,
     pub created: i64,
+}
+
+/// A public link to a path inside a vault.
+#[derive(Debug, Clone)]
+pub struct LinkRow {
+    pub id: String,
+    pub vault_id: String,
+    pub path: String,
+    pub pass_hash: Option<String>,
+    pub pass_salt: Option<String>,
+    pub expires: Option<i64>,
+    pub created: i64,
+}
+
+impl LinkRow {
+    pub fn has_password(&self) -> bool {
+        self.pass_hash.is_some()
+    }
+
+    pub fn expired(&self, now: i64) -> bool {
+        matches!(self.expires, Some(t) if t <= now)
+    }
 }
 
 pub struct Db {
@@ -550,6 +582,87 @@ impl Db {
         )?;
         Ok(n > 0)
     }
+
+    // ----------------------------------------------------------------- links
+
+    /// Create a public link. `password` is hashed the same way user
+    /// passwords are; an empty option means anyone with the URL can read.
+    pub fn create_link(
+        &self,
+        vault_id: &str,
+        path: &str,
+        password: Option<&str>,
+        expires: Option<i64>,
+    ) -> Result<String> {
+        let id = Self::random_id(12);
+        let (hash, salt) = match password {
+            Some(pw) => {
+                if pw.is_empty() {
+                    return Err(anyhow!("an empty password means an open link — pass none instead"));
+                }
+                let salt = crypto::random_salt();
+                let hash =
+                    crypto::derive_key_from_passphrase(pw.as_bytes(), &salt)?.as_bytes();
+                (Some(hex::encode(hash)), Some(hex::encode(salt)))
+            }
+            None => (None, None),
+        };
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO links (id, vault_id, path, pass_hash, pass_salt, expires, created)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, vault_id, path, hash, salt, expires, Self::now()],
+        )?;
+        Ok(id)
+    }
+
+    pub fn links_for_vault(&self, vault_id: &str) -> Result<Vec<LinkRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, vault_id, path, pass_hash, pass_salt, expires, created
+             FROM links WHERE vault_id = ?1 ORDER BY created DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![vault_id], link_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn link_get(&self, id: &str) -> Result<Option<LinkRow>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn.query_row(
+            "SELECT id, vault_id, path, pass_hash, pass_salt, expires, created
+             FROM links WHERE id = ?1",
+            params![id],
+            link_row,
+        );
+        match row {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn link_delete(&self, vault_id: &str, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM links WHERE vault_id = ?1 AND id = ?2",
+            params![vault_id, id],
+        )?;
+        Ok(n > 0)
+    }
+}
+
+fn link_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<LinkRow> {
+    Ok(LinkRow {
+        id: r.get(0)?,
+        vault_id: r.get(1)?,
+        path: r.get(2)?,
+        pass_hash: r.get(3)?,
+        pass_salt: r.get(4)?,
+        expires: r.get(5)?,
+        created: r.get(6)?,
+    })
 }
 
 #[cfg(test)]
@@ -687,6 +800,52 @@ mod tests {
         assert!(db.trash_remove(&vault, &id).unwrap());
         assert!(db.trash_list(&vault).unwrap().is_empty());
         assert!(!db.trash_remove(&vault, &id).unwrap());
+    }
+
+    #[test]
+    fn links_round_trip_with_optional_passwords() {
+        let (_d, db) = db("db-links");
+        let owner = db.create_user("a", "pw").unwrap();
+        let vault = db.create_vault("v", &owner, false).unwrap();
+
+        let open = db.create_link(&vault, "docs", None, None).unwrap();
+        let locked = db
+            .create_link(&vault, "secret.txt", Some("open sesame"), Some(9_999_999_999))
+            .unwrap();
+
+        let rows = db.links_for_vault(&vault).unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let open_row = db.link_get(&open).unwrap().unwrap();
+        assert!(!open_row.has_password());
+        assert!(!open_row.expired(1));
+        assert_eq!(open_row.path, "docs");
+
+        let locked_row = db.link_get(&locked).unwrap().unwrap();
+        assert!(locked_row.has_password());
+        assert!(!locked_row.expired(9_999_999_998));
+        assert!(locked_row.expired(10_000_000_000), "expired links say so");
+
+        // The stored hash verifies against the right password only.
+        let salt = hex::decode(locked_row.pass_salt.as_deref().unwrap()).unwrap();
+        let mut arr = [0u8; crypto::SALT_LEN];
+        arr.copy_from_slice(&salt);
+        let good = crypto::derive_key_from_passphrase(b"open sesame", &arr).unwrap();
+        let bad = crypto::derive_key_from_passphrase(b"wrong", &arr).unwrap();
+        assert_eq!(hex::encode(good.as_bytes()), locked_row.pass_hash.unwrap());
+        assert_ne!(hex::encode(bad.as_bytes()), "x");
+
+        assert!(db.link_delete(&vault, &open).unwrap());
+        assert!(db.link_get(&open).unwrap().is_none());
+        assert!(!db.link_delete(&vault, &open).unwrap());
+    }
+
+    #[test]
+    fn empty_link_passwords_are_rejected() {
+        let (_d, db) = db("db-linkpw");
+        let owner = db.create_user("a", "pw").unwrap();
+        let vault = db.create_vault("v", &owner, false).unwrap();
+        assert!(db.create_link(&vault, "docs", Some(""), None).is_err());
     }
 
     #[test]

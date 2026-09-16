@@ -388,7 +388,11 @@ function renderFiles() {
       dl.className = 'ghost';
       dl.textContent = 'Download';
       dl.addEventListener('click', () => downloadFile(entry.path));
-      actions.appendChild(dl);
+      const hist = document.createElement('button');
+      hist.className = 'ghost';
+      hist.textContent = 'Versions';
+      hist.addEventListener('click', () => openVersions(entry.path));
+      actions.append(dl, hist);
     }
 
     const del = document.createElement('button');
@@ -1210,6 +1214,7 @@ function openShareDrawer() {
       err.hidden = false;
     }
   });
+  loadLinks().catch(() => {});
 }
 
 function closeShareDrawer() {
@@ -1296,6 +1301,199 @@ async function revokeShare(username) {
     return;
   }
   await loadShares().catch(() => {});
+}
+
+/* ------------------------------------------------------- public links */
+
+async function loadLinks() {
+  const data = await (await api(vaultApi('/links'))).json();
+  const list = document.getElementById('link-list');
+  const cwd = document.getElementById('link-cwd');
+  if (!list) return;
+  if (cwd) cwd.textContent = state.cwd ? '/' + state.cwd : '/ (the whole vault)';
+  list.innerHTML = '';
+
+  if (!data.items.length) {
+    const li = document.createElement('li');
+    li.className = 'empty';
+    li.textContent = 'No public links yet.';
+    list.appendChild(li);
+    return;
+  }
+
+  for (const link of data.items) {
+    const li = document.createElement('li');
+    li.className = 'entry';
+
+    const icon = document.createElement('span');
+    icon.className = 'entry-icon';
+    icon.textContent = '🔗';
+
+    const name = document.createElement('span');
+    name.className = 'entry-name';
+    name.textContent = link.path || '/';
+    name.title = link.has_password ? 'password protected' : 'open link';
+
+    const meta = document.createElement('span');
+    meta.className = 'entry-meta';
+    meta.textContent = link.has_password ? '🔒 password' : 'open';
+    if (link.expires) meta.textContent += ' · expires ' + new Date(link.expires * 1000).toLocaleDateString();
+
+    const url = `${window.location.origin}/s/${link.id}`;
+    const copy = document.createElement('button');
+    copy.className = 'ghost';
+    copy.textContent = 'Copy URL';
+    copy.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(url);
+        toast('Link copied', 'ok');
+      } catch (e) {
+        window.prompt('Copy this link:', url);
+      }
+    });
+
+    const del = document.createElement('button');
+    del.className = 'ghost danger';
+    del.textContent = 'Remove';
+    del.addEventListener('click', () => deleteLink(link));
+
+    li.append(icon, name, meta, copy, del);
+    list.appendChild(li);
+  }
+}
+
+async function createLink() {
+  const err = document.getElementById('share-error');
+  if (err) err.hidden = true;
+  const password = document.getElementById('link-password').value;
+  try {
+    const res = await api(`/api/v1/vaults/${encodeURIComponent(state.vault)}/links`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: state.cwd, password: password || null }),
+    });
+    const data = await res.json();
+    document.getElementById('link-password').value = '';
+    toast('Link created', 'ok');
+    await loadLinks().catch(() => {});
+    try {
+      await navigator.clipboard.writeText(`${window.location.origin}${data.url}`);
+      toast('Link copied to the clipboard', 'ok');
+    } catch (e) { /* clipboard unavailable — the URL is in the list */ }
+  } catch (e) {
+    if (err) {
+      err.textContent = e.message;
+      err.hidden = false;
+    }
+  }
+}
+
+async function deleteLink(link) {
+  if (!window.confirm(`Remove the link to ${link.path || '/'}? Anyone holding it loses access.`)) return;
+  try {
+    await api(`/api/v1/vaults/${encodeURIComponent(state.vault)}/links/${encodeURIComponent(link.id)}`,
+      { method: 'DELETE' });
+    toast('Link removed', 'ok');
+  } catch (e) {
+    toast(`Removing the link failed: ${e.message}`, 'error');
+    return;
+  }
+  await loadLinks().catch(() => {});
+}
+
+/* ----------------------------------------------------- file versions */
+
+let versionsPath = '';
+
+function openVersions(path) {
+  versionsPath = path;
+  const title = document.getElementById('versions-title');
+  const fileName = path.split('/').filter(Boolean).pop() || path;
+  if (title) title.textContent = `Versions of ${fileName}`;
+  const modal = document.getElementById('versions-modal');
+  if (modal) modal.hidden = false;
+  loadVersions().catch((e) => toast(e.message, 'error'));
+}
+
+function closeVersions() {
+  const modal = document.getElementById('versions-modal');
+  if (modal) modal.hidden = true;
+}
+
+async function loadVersions() {
+  const list = document.getElementById('versions-list');
+  const err = document.getElementById('versions-error');
+  if (err) err.hidden = true;
+  if (!list) return;
+  list.innerHTML = '';
+  const data = await (await api(
+    `/api/v1/vaults/${encodeURIComponent(state.vault)}/fs/versions?path=${encodeURIComponent(versionsPath)}`,
+  )).json();
+
+  if (!data.items.length) {
+    const li = document.createElement('li');
+    li.className = 'empty';
+    li.textContent = 'No earlier versions — this file has only ever had this content.';
+    list.appendChild(li);
+    return;
+  }
+
+  for (const v of data.items) {
+    const li = document.createElement('li');
+    li.className = 'entry';
+
+    const icon = document.createElement('span');
+    icon.className = 'entry-icon';
+    icon.textContent = '🕘';
+
+    const name = document.createElement('span');
+    name.className = 'entry-name';
+    name.textContent = new Date(v.snapshot_time * 1000).toLocaleString();
+    name.title = `saved by ${v.device}`;
+
+    const meta = document.createElement('span');
+    meta.className = 'entry-meta';
+    meta.textContent = formatBytes(v.size);
+
+    const dl = document.createElement('button');
+    dl.className = 'ghost';
+    dl.textContent = 'Download';
+    dl.addEventListener('click', () => downloadVersion(v, false));
+
+    const restore = document.createElement('button');
+    restore.className = 'ghost';
+    restore.textContent = 'Restore';
+    restore.addEventListener('click', () => downloadVersion(v, true));
+
+    li.append(icon, name, meta, dl, restore);
+    list.appendChild(li);
+  }
+}
+
+async function downloadVersion(v, restore) {
+  try {
+    const base = `/api/v1/vaults/${encodeURIComponent(state.vault)}/fs/versions`;
+    const query = `path=${encodeURIComponent(versionsPath)}&id=${encodeURIComponent(v.id)}`;
+    if (restore) {
+      await api(`${base}/restore?${query}`, { method: 'POST' });
+      toast(`Restored the version from ${new Date(v.snapshot_time * 1000).toLocaleString()}`, 'ok');
+      closeVersions();
+      await refreshAfterChange();
+      return;
+    }
+    const res = await api(`${base}/download?${query}`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = versionsPath.split('/').filter(Boolean).pop() || 'version';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 20000);
+  } catch (e) {
+    toast(`Version ${restore ? 'restore' : 'download'} failed: ${e.message}`, 'error');
+  }
 }
 
 /* ------------------------------------------------------------ wiring */
@@ -1531,6 +1729,12 @@ function init() {
   }
   const btnEmptyTrash = document.getElementById('btn-empty-trash');
   if (btnEmptyTrash) btnEmptyTrash.addEventListener('click', emptyTrash);
+  const btnCreateLink = document.getElementById('btn-create-link');
+  if (btnCreateLink) btnCreateLink.addEventListener('click', () => createLink().catch(() => {}));
+  const versionsClose = document.getElementById('versions-close');
+  if (versionsClose) versionsClose.addEventListener('click', closeVersions);
+  const versionsCancel = document.getElementById('versions-cancel');
+  if (versionsCancel) versionsCancel.addEventListener('click', closeVersions);
 
   $('#btn-upload').addEventListener('click', () => $('#file-input').click());
   $('#file-input').addEventListener('change', (ev) => {

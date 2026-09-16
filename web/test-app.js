@@ -129,16 +129,28 @@ function makeFetch(calls, { firstRun, shareRole = 'owner' }) {
     else if (url.includes('/whoami')) body = { user: 'ada' };
     else if (url.includes('/timeline')) body = { items: [] };
     else if (url.includes('/stats')) body = { files: 0, dirs: 1, symlinks: 0, bytes: 0 };
-    else if (url.includes('/trash/restore')) body = { ok: true, path: 'old.txt' };
+    else if (url.includes('/fs/versions/restore')) body = { ok: true };
+    else if (url.includes('/fs/versions')) {
+      body = { items: [{ id: 'ver1', size: 5, mtime: 0, snapshot_time: 0, device: 'laptop' }] };
+    } else if (url.includes('/trash/restore')) body = { ok: true, path: 'old.txt' };
     else if (url.includes('/trash')) {
       body = /trash\?/.test(url)
         ? { ok: true }
         : { items: [{ id: 't1', path: 'old.txt', kind: 'file', size: 5, deleted_at: 0 }] };
+    } else if (url.includes('/links')) {
+      body = url.includes('/links/lnk')
+        ? { ok: true }
+        : { items: [{ id: 'lnk1', path: 'docs', has_password: false, expires: null, created: 0 }] };
     } else if (url.includes('/shares')) {
       body = /shares\/[^/?]+$/.test(url.split('?')[0]) && url.split('?')[0].endsWith('/shares') === false
         ? { ok: true }
         : { shares: [{ username: 'bob', role: 'write', created: 0 }] };
-    } else if (url.includes('/fs')) body = { path: '', entries: [] };
+    } else if (url.includes('/fs')) {
+      body = {
+        path: '',
+        entries: [{ name: 'a.txt', path: 'a.txt', kind: 'file', size: 1, mtime: 0 }],
+      };
+    }
     else if (url.includes('/vaults')) {
       body = { vaults: [{ name: 'myvault', encrypted: false, role: shareRole }] };
     }
@@ -217,9 +229,15 @@ function section(name) {
 const tick = () => new Promise((r) => setTimeout(r, 25));
 
 function buttonByText(el, text) {
-  return (el.children || []).find(
-    (c) => c.textContent === text && c.events && c.events.click,
-  );
+  // Buttons may sit directly on the row or inside a nested actions span.
+  for (const c of el.children || []) {
+    if (c.textContent === text && c.events && c.events.click) return c;
+    const nested = (c.children || []).find(
+      (g) => g.textContent === text && g.events && g.events.click,
+    );
+    if (nested) return nested;
+  }
+  return undefined;
 }
 
 
@@ -382,6 +400,68 @@ async function main() {
 
     dom.byId('#share-close').fire('click');
     check('drawer closes', dom.byId('#share-drawer').hidden === true);
+  }
+
+  section('public links: list, create, guarded remove');
+
+  {
+    const { dom, calls } = await boot({ includeSignup: true, firstRun: false });
+    dom.byId('#login-server').value = 'http://srv:8787';
+    dom.byId('#login-username').value = 'ada';
+    dom.byId('#login-password').value = 'hunter22';
+    dom.byId('#login-form').fire('submit');
+    await tick(); await tick();
+
+    dom.byId('#btn-share').fire('click');
+    await tick(); await tick();
+    check('existing links are listed in the drawer',
+      (dom.byId('#link-list').innerHTML || '').includes('docs') ||
+      (dom.byId('#link-list').children[0] || {}).className === 'entry');
+
+    dom.byId('#link-password').value = 'sesame';
+    dom.byId('#btn-create-link').fire('click');
+    await tick(); await tick();
+    check('creating a link posts the folder path and password',
+      calls.some((u) => u.includes('/links')));
+
+    const row = dom.byId('#link-list').children[0];
+    const remove = buttonByText(row, 'Remove');
+    check('link row offers Remove', Boolean(remove));
+    remove.fire('click');
+    await tick();
+    check('removing a link is guarded by confirm()',
+      !calls.some((u) => /links\/lnk1/.test(u) && true));
+  }
+
+  section('file versions: open modal, restore');
+
+  {
+    const { dom, calls } = await boot({ includeSignup: true, firstRun: false });
+    dom.byId('#login-server').value = 'http://srv:8787';
+    dom.byId('#login-username').value = 'ada';
+    dom.byId('#login-password').value = 'hunter22';
+    dom.byId('#login-form').fire('submit');
+    await tick(); await tick();
+
+    const row = dom.byId('#entry-list').children[0];
+    const versions = buttonByText(row, 'Versions');
+    check('file rows offer a Versions action', Boolean(versions));
+    versions.fire('click');
+    await tick(); await tick();
+    check('versions modal opens', dom.byId('#versions-modal').hidden === false);
+    check('versions were fetched for the file',
+      calls.some((u) => u.includes('/fs/versions?path=')));
+    const vrow = dom.byId('#versions-list').children[0];
+    check('a version row shows the saved date',
+      (vrow.textContent || '').length > 0 || (vrow.children || []).length > 0);
+
+    const restore = buttonByText(vrow, 'Restore');
+    check('version row offers Restore', Boolean(restore));
+    restore.fire('click');
+    await tick(); await tick();
+    check('restore hits the versions restore endpoint',
+      calls.some((u) => u.includes('/fs/versions/restore')));
+    check('modal closes after restoring', dom.byId('#versions-modal').hidden === true);
   }
 
   section('a read-only share hides the share button');

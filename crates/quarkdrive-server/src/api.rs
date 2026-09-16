@@ -25,15 +25,16 @@ use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+use quarkdrive_core::crypto;
 use quarkdrive_core::hash::ObjectId;
 use quarkdrive_core::tree::{Kind, NodeRef, Snapshot};
 
-use crate::db::Db;
+use crate::db::{Db, LinkRow};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 use axum::extract::ConnectInfo;
 use crate::media::{self, MediaIndex, MediaRow};
-use crate::vault::{Vault, VaultStats};
+use crate::vault::{split_path, Vault, VaultStats, FileVersion};
 
 /// Uploads are limited by memory, not per request, so allow large files.
 const MAX_UPLOAD_BYTES: usize = 4 * 1024 * 1024 * 1024;
@@ -973,7 +974,367 @@ async fn fs_delete(
     Ok(Json(OkResp { ok: true }))
 }
 
-// ----------------------------------------------------------------- trash
+// ------------------------------------------------------- file versions
+
+#[derive(Serialize)]
+struct VersionView {
+    /// The tree node's content address — the version's identity.
+    id: String,
+    size: u64,
+    mtime: i64,
+    snapshot_time: i64,
+    device: String,
+}
+
+/// Every distinct content the path has ever held, newest first.
+async fn fs_versions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vault): Path<String>,
+    Query(q): Query<PathQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let (v, _role) = state.vault(&vault, &user_id)?;
+    let items: Vec<VersionView> = v
+        .versions(&q.path, 100)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?
+        .into_iter()
+        .map(|fv: FileVersion| VersionView {
+            id: fv.node_id.to_string(),
+            size: fv.size,
+            mtime: fv.mtime,
+            snapshot_time: fv.snapshot_time,
+            device: fv.device,
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "items": items })))
+}
+
+#[derive(Deserialize)]
+struct VersionQuery {
+    path: String,
+    id: String,
+}
+
+async fn fs_version_download(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vault): Path<String>,
+    Query(q): Query<VersionQuery>,
+) -> Result<Response, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let (v, _role) = state.vault(&vault, &user_id)?;
+    let node_id = ObjectId::from_hex(&q.id)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "bad version id"))?;
+    let data = v
+        .read_node_bytes(&node_id)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?
+        .ok_or_else(|| ApiError::not_found("no such version"))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"version.bin\"".to_string(),
+            ),
+        ],
+        data,
+    )
+        .into_response())
+}
+
+async fn fs_version_restore(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vault): Path<String>,
+    Query(q): Query<VersionQuery>,
+) -> Result<Json<OkResp>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if !role.can_write() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this vault is shared with you read-only",
+        ));
+    }
+    let node_id = ObjectId::from_hex(&q.id)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "bad version id"))?;
+    v.restore_version(&q.path, &node_id)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?
+        .ok_or_else(|| ApiError::not_found("no such version"))?;
+    Ok(Json(OkResp { ok: true }))
+}
+
+// ---------------------------------------------------------- public links
+
+#[derive(Deserialize)]
+struct CreateLinkReq {
+    path: String,
+    #[serde(default)]
+    password: Option<String>,
+    /// Unix seconds; absent or null means the link never expires.
+    #[serde(default)]
+    expires_secs: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct LinkView {
+    id: String,
+    path: String,
+    /// The visitor URL, relative to this server.
+    url: String,
+    has_password: bool,
+    expires: Option<i64>,
+    created: i64,
+}
+
+async fn create_link(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vault): Path<String>,
+    Json(req): Json<CreateLinkReq>,
+) -> Result<Json<LinkView>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if !role.can_write() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this vault is shared with you read-only",
+        ));
+    }
+    if v.lookup_id(&req.path)?.is_none() {
+        return Err(ApiError::not_found("no such path"));
+    }
+    let id = state
+        .db
+        .create_link(&v.row.id, &req.path, req.password.as_deref(), req.expires_secs)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let row = state
+        .db
+        .link_get(&id)?
+        .ok_or_else(|| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "link vanished"))?;
+    Ok(Json(link_view(&row)))
+}
+
+fn link_view(row: &LinkRow) -> LinkView {
+    LinkView {
+        id: row.id.clone(),
+        path: row.path.clone(),
+        url: format!("/s/{}", row.id),
+        has_password: row.has_password(),
+        expires: row.expires,
+        created: row.created,
+    }
+}
+
+async fn list_links(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vault): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if !role.can_write() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this vault is shared with you read-only",
+        ));
+    }
+    let items: Vec<LinkView> = state
+        .db
+        .links_for_vault(&v.row.id)
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .iter()
+        .map(link_view)
+        .collect();
+    Ok(Json(serde_json::json!({ "items": items })))
+}
+
+async fn delete_link(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((vault, id)): Path<(String, String)>,
+) -> Result<Json<OkResp>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if !role.can_write() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this vault is shared with you read-only",
+        ));
+    }
+    if state.db.link_delete(&v.row.id, &id)? {
+        Ok(Json(OkResp { ok: true }))
+    } else {
+        Err(ApiError::not_found("no such link"))
+    }
+}
+
+/// What someone with the URL may read.
+///
+/// Passwords travel in an `X-Link-Password` header on every request: the
+/// server keeps no link sessions, and nothing sensitive lands in a URL.
+fn public_link(
+    state: &AppState,
+    id: &str,
+    headers: &HeaderMap,
+) -> Result<(LinkRow, Vault), ApiError> {
+    let link = state
+        .db
+        .link_get(id)?
+        .ok_or_else(|| ApiError::not_found("no such link"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if link.expired(now) {
+        return Err(ApiError::new(StatusCode::GONE, "this link has expired"));
+    }
+    if link.has_password() {
+        let given = headers
+            .get("x-link-password")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !verify_link_password(&link, given) {
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "this link needs a password",
+            ));
+        }
+    }
+    let row = state
+        .db
+        .vault_by_id(&link.vault_id)?
+        .ok_or_else(|| ApiError::not_found("no such link"))?;
+    let vault = Vault::open(&state.data_dir, row)?;
+    Ok((link, vault))
+}
+
+fn verify_link_password(link: &LinkRow, given: &str) -> bool {
+    let (Some(hash_hex), Some(salt_hex)) = (&link.pass_hash, &link.pass_salt) else {
+        return false;
+    };
+    let (Ok(hash), Ok(salt_bytes)) = (hex::decode(hash_hex), hex::decode(salt_hex)) else {
+        return false;
+    };
+    let mut salt = [0u8; crypto::SALT_LEN];
+    if salt_bytes.len() != crypto::SALT_LEN {
+        return false;
+    }
+    salt.copy_from_slice(&salt_bytes);
+    let actual = match crypto::derive_key_from_passphrase(given.as_bytes(), &salt) {
+        Ok(k) => k.as_bytes().to_vec(),
+        Err(_) => return false,
+    };
+    // Constant-time comparison, as with user passwords.
+    let mut diff = 0u8;
+    for (a, b) in hash.iter().zip(actual.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0 && hash.len() == actual.len()
+}
+
+/// Join the link's root with a visitor-supplied relative path, rejecting
+/// anything that escapes (split_path already refuses ".." and controls).
+fn resolve_under_link(link: &LinkRow, rel: &str) -> Result<String, ApiError> {
+    let base =
+        split_path(&link.path).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+    // An empty relative path means the link's root itself — same convention
+    // as list_dir, and not an error.
+    let rel_trim = rel.trim_matches('/');
+    let rel_parts = if rel_trim.is_empty() {
+        Vec::new()
+    } else {
+        split_path(rel_trim).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?
+    };
+    Ok(base
+        .iter()
+        .chain(rel_parts.iter())
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join("/"))
+}
+
+async fn public_meta(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (link, vault) = public_link(&state, &id, &headers)?;
+    let (_node_id, node) = vault
+        .lookup_id(&link.path)?
+        .ok_or_else(|| ApiError::not_found("the shared item no longer exists"))?;
+    Ok(Json(serde_json::json!({
+        "id": link.id,
+        "name": link.path.rsplit('/').next().unwrap_or(&link.path),
+        "kind": if node.kind() == Kind::Dir { "dir" } else { "file" },
+        "size": node.size(),
+        "has_password": link.has_password(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct PublicListQuery {
+    #[serde(default)]
+    path: String,
+}
+
+/// List a folder inside a shared link. `path` is relative to the link root.
+async fn public_list(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<PublicListQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (link, vault) = public_link(&state, &id, &headers)?;
+    let full = resolve_under_link(&link, &q.path)?;
+    let entries = vault
+        .list_dir(&full)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+    // Paths stay relative to the link, so the visitor never learns where in
+    // the vault the share lives.
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    for e in entry_views(&link.vault_id, entries) {
+        let rel = if link.path.is_empty() {
+            e.path.clone()
+        } else {
+            e.path[link.path.len() + 1..].to_string()
+        };
+        items.push(serde_json::json!({
+            "name": e.name,
+            "path": rel,
+            "kind": e.kind,
+            "size": e.size,
+        }));
+    }
+    Ok(Json(serde_json::json!({ "path": q.path, "items": items })))
+}
+
+/// Download a file from a shared link.
+async fn public_download(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<PublicListQuery>,
+) -> Result<Response, ApiError> {
+    let (link, vault) = public_link(&state, &id, &headers)?;
+    let full = resolve_under_link(&link, &q.path)?;
+    let data = vault
+        .read_file(&full)?
+        .ok_or_else(|| ApiError::not_found("no such file"))?;
+    let filename = full.rsplit('/').next().unwrap_or("download").to_string();
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}\"", sanitize_filename(&filename)),
+            ),
+        ],
+        data,
+    )
+        .into_response())
+}
 
 #[derive(Serialize)]
 struct TrashView {
@@ -1316,6 +1677,23 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(trash_list).delete(trash_purge),
         )
         .route("/api/v1/vaults/:vault/trash/restore", post(trash_restore))
+        .route("/api/v1/vaults/:vault/fs/versions", get(fs_versions))
+        .route(
+            "/api/v1/vaults/:vault/fs/versions/download",
+            get(fs_version_download),
+        )
+        .route(
+            "/api/v1/vaults/:vault/fs/versions/restore",
+            post(fs_version_restore),
+        )
+        .route(
+            "/api/v1/vaults/:vault/links",
+            get(list_links).post(create_link),
+        )
+        .route("/api/v1/vaults/:vault/links/:id", delete(delete_link))
+        .route("/api/v1/public/:id", get(public_meta))
+        .route("/api/v1/public/:id/list", get(public_list))
+        .route("/api/v1/public/:id/download", get(public_download))
         // Object protocol used by the desktop and Android sync engine.
         .route("/api/v1/vaults/:vault/head", get(get_head))
         .route("/api/v1/vaults/:vault/snapshots/:id", get(get_snapshot))

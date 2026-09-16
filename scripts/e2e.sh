@@ -278,6 +278,75 @@ curl -sf -X DELETE "${auth[@]}" "$SRV/api/v1/vaults/photos/trash?all=true" >/dev
 count=$(curl -s "${auth[@]}" "$SRV/api/v1/vaults/photos/trash" | python3 -c "import json,sys; print(len(json.load(sys.stdin)['items']))")
 expect "$count" "0" "purge empties the trash"
 
+echo "== file versions =="
+curl -sf -X PUT "${auth[@]}" --data-binary 'first draft' \
+     "$SRV/api/v1/vaults/photos/fs?path=versions.txt" >/dev/null
+curl -sf -X PUT "${auth[@]}" --data-binary 'second draft, much longer than the first' \
+     "$SRV/api/v1/vaults/photos/fs?path=versions.txt" >/dev/null
+VCOUNT=$(curl -s "${auth[@]}" "$SRV/api/v1/vaults/photos/fs/versions?path=versions.txt" | python3 -c "
+import json,sys; print(len(json.load(sys.stdin)['items']))")
+expect "$VCOUNT" "2" "two contents of the same path are two versions"
+OLD_ID=$(curl -s "${auth[@]}" "$SRV/api/v1/vaults/photos/fs/versions?path=versions.txt" | python3 -c "
+import json,sys; print(json.load(sys.stdin)['items'][-1]['id'])")
+expect "$(curl -s "${auth[@]}" "$SRV/api/v1/vaults/photos/fs/versions/download?path=versions.txt&id=$OLD_ID")" \
+  "first draft" "an old version's bytes come back intact"
+curl -sf -X POST "${auth[@]}" \
+     "$SRV/api/v1/vaults/photos/fs/versions/restore?path=versions.txt&id=$OLD_ID" >/dev/null
+expect "$(curl -s "${auth[@]}" "$SRV/api/v1/vaults/photos/fs/download?path=versions.txt")" \
+  "first draft" "restoring an old version replaces the current file"
+expect "$(curl -s -o /dev/null -w '%{http_code}' "${carol_auth[@]}" "$SRV/api/v1/vaults/photos/fs/versions/restore?path=versions.txt&id=$OLD_ID" -X POST)" \
+  "403" "read-only share cannot restore versions"
+
+echo "== public links =="
+curl -sf -X PUT "${auth[@]}" --data-binary 'readable by the world' \
+     "$SRV/api/v1/vaults/photos/fs?path=shared/public.txt" >/dev/null
+LINK_ID=$(curl -s -X POST "${auth[@]}" "$SRV/api/v1/vaults/photos/links" \
+  -H 'content-type: application/json' -d '{"path":"shared"}' | python3 -c "
+import json,sys; print(json.load(sys.stdin).get('id',''))")
+if [[ -n "$LINK_ID" ]]; then
+  pass "link created"
+else
+  fail "link creation failed"
+fi
+expect "$(curl -s -o /dev/null -w '%{http_code}' "$SRV/api/v1/public/$LINK_ID")" \
+  "200" "the link answers without any account"
+expect "$(curl -s "$SRV/api/v1/public/$LINK_ID/list?path=" | python3 -c "
+import json,sys; print(json.load(sys.stdin)['items'][0]['name'])")" \
+  "public.txt" "the link lists the shared folder"
+expect "$(curl -s "$SRV/api/v1/public/$LINK_ID/download?path=public.txt")" \
+  "readable by the world" "the link downloads the file"
+# Visitors cannot leave the shared folder.
+for esc in "..%2Fnotes.txt" "%2e%2e%2Fvaults"; do
+  expect "$(curl -s -o /dev/null -w '%{http_code}' "$SRV/api/v1/public/$LINK_ID/download?path=$esc")" \
+    "400" "link path '$esc' is refused"
+done
+# Password-protected link.
+PLINK_ID=$(curl -s -X POST "${auth[@]}" "$SRV/api/v1/vaults/photos/links" \
+  -H 'content-type: application/json' -d '{"path":"shared","password":"hush now"}' | python3 -c "
+import json,sys; print(json.load(sys.stdin).get('id',''))")
+expect "$(curl -s -o /dev/null -w '%{http_code}' "$SRV/api/v1/public/$PLINK_ID")" \
+  "401" "a password link demands the password"
+expect "$(curl -s -o /dev/null -w '%{http_code}' "$SRV/api/v1/public/$PLINK_ID" -H 'X-Link-Password: wrong')" \
+  "401" "a wrong password is refused"
+expect "$(curl -s -o /dev/null -w '%{http_code}' "$SRV/api/v1/public/$PLINK_ID" -H 'X-Link-Password: hush now')" \
+  "200" "the right password opens the link"
+# Expiry.
+ELINK_ID=$(curl -s -X POST "${auth[@]}" "$SRV/api/v1/vaults/photos/links" \
+  -H 'content-type: application/json' -d '{"path":"shared","expires_secs":1}' | python3 -c "
+import json,sys; print(json.load(sys.stdin).get('id',''))")
+sleep 1.5
+expect "$(curl -s -o /dev/null -w '%{http_code}' "$SRV/api/v1/public/$ELINK_ID")" \
+  "410" "an expired link says so"
+# Revocation.
+curl -sf -X DELETE "${auth[@]}" "$SRV/api/v1/vaults/photos/links/$LINK_ID" >/dev/null
+expect "$(curl -s -o /dev/null -w '%{http_code}' "$SRV/api/v1/public/$LINK_ID")" \
+  "404" "a removed link stops answering"
+# The visitor page itself.
+case "$(curl -s "$SRV/s/$PLINK_ID")" in
+  *public.js*) pass "the /s/<id> page serves the visitor UI";;
+  *) fail "/s/<id> did not serve the visitor page";;
+esac
+
 echo "== login rate limiting =="
 for i in 1 2 3 4 5 6; do
   code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$SRV/api/v1/auth/login" \

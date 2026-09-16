@@ -388,6 +388,85 @@ impl Vault {
         Ok(())
     }
 
+    /// Resolve a path against an arbitrary root (a snapshot's tree, not
+    /// necessarily the current one).
+    fn lookup_id_at(&self, root: &ObjectId, path: &str) -> Result<Option<(ObjectId, Node)>> {
+        let trees = self.trees();
+        let mut cur = *root;
+        for segment in path.split('/').filter(|s| !s.is_empty()) {
+            let node = match trees.get_node(&cur)? {
+                Some(n) => n,
+                None => return Ok(None),
+            };
+            let entries = match node.as_dir() {
+                Some(e) => e,
+                None => return Ok(None),
+            };
+            cur = match entries.get(segment) {
+                Some(r) => r.id,
+                None => return Ok(None),
+            };
+        }
+        Ok(trees.get_node(&cur)?.map(|n| (cur, n)))
+    }
+
+    /// Every distinct version of the file at `path`, newest first.
+    ///
+    /// Walks the snapshot chain and notes each content address the path has
+    /// ever pointed at. Overwrites create new snapshots; renames away and
+    /// back are picked up too. Bounded on both distinct versions and chain
+    /// depth, so ancient histories cost a bounded number of object reads.
+    pub fn versions(&self, path: &str, limit: usize) -> Result<Vec<FileVersion>> {
+        self.require_readable()?;
+        let mut out: Vec<FileVersion> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = self.head()?;
+        let mut steps = 0usize;
+        while let Some(snap_id) = cursor {
+            if out.len() >= limit || steps >= 500 {
+                break;
+            }
+            steps += 1;
+            let snap = self
+                .snapshot(&snap_id)?
+                .ok_or_else(|| anyhow!("missing snapshot in history"))?;
+            cursor = snap.parent;
+            if let Some((node_id, node)) = self.lookup_id_at(&snap.root, path)? {
+                if node.kind() == Kind::File && seen.insert(node_id) {
+                    out.push(FileVersion {
+                        node_id,
+                        size: node.size(),
+                        mtime: node.mtime(),
+                        snapshot_time: snap.time,
+                        device: snap.device.clone(),
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reassemble the bytes of a specific tree node. Only file nodes carry
+    /// chunks; anything else (or a missing object) is None.
+    pub fn read_node_bytes(&self, node_id: &ObjectId) -> Result<Option<Vec<u8>>> {
+        self.require_readable()?;
+        let trees = self.trees();
+        match trees.get_node(node_id)? {
+            Some(n) if n.kind() == Kind::File => Ok(Some(trees.read_file(&n)?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Put an old version's content back at `path`. The chunk stores are
+    /// content-addressed, so this re-uses the existing bytes.
+    pub fn restore_version(&self, path: &str, node_id: &ObjectId) -> Result<Option<Vec<u8>>> {
+        let data = self.read_node_bytes(node_id)?;
+        if let Some(bytes) = &data {
+            self.put_file(path, bytes, None)?;
+        }
+        Ok(data)
+    }
+
     /// What is in this vault, and when it was last touched.
     ///
     /// Walks the tree rather than trusting a counter, so it stays right even
@@ -452,6 +531,18 @@ impl Vault {
     }
 }
 
+/// One stored version of a file: the tree node is its own content address,
+/// so "a version" is just an id that still reassembles.
+#[derive(Debug, Clone)]
+pub struct FileVersion {
+    pub node_id: ObjectId,
+    pub size: u64,
+    pub mtime: i64,
+    /// When the snapshot that captured this version was committed.
+    pub snapshot_time: i64,
+    pub device: String,
+}
+
 /// A summary of a vault's contents.
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct VaultStats {
@@ -466,7 +557,7 @@ pub struct VaultStats {
     pub updated: Option<i64>,
 }
 
-fn split_path(path: &str) -> Result<Vec<String>> {
+pub(crate) fn split_path(path: &str) -> Result<Vec<String>> {
     let parts: Vec<String> = path
         .split('/')
         .filter(|s| !s.is_empty() && *s != ".")
@@ -614,6 +705,34 @@ mod tests {
         assert!(v.remove("dir").unwrap());
         assert_eq!(names(&v, ""), vec!["keep.txt"]);
         assert!(!v.remove("never-existed").unwrap(), "removing nothing is not an error");
+    }
+
+    #[test]
+    fn overwrites_build_a_version_history() {
+        let (_d, v) = vault("v-versions", false);
+        v.put_file("report.txt", b"first draft", None).unwrap();
+        v.put_file("report.txt", b"second draft with more words", None).unwrap();
+        v.remove("report.txt").unwrap();
+        v.put_file("report.txt", b"third draft", None).unwrap();
+
+        let versions = v.versions("report.txt", 10).unwrap();
+        assert_eq!(versions.len(), 3, "three distinct contents, oldest delete is skipped");
+        let sizes: Vec<u64> = versions.iter().map(|x| x.size).collect();
+        assert_eq!(sizes, vec![11, 28, 11], "newest first");
+
+        // Any version can be read back by its node id, and restoring an old
+        // one replaces the current content with those exact bytes.
+        let oldest = versions.last().unwrap();
+        assert_eq!(
+            v.read_node_bytes(&oldest.node_id).unwrap().as_deref(),
+            Some(b"first draft".as_slice())
+        );
+        v.restore_version("report.txt", &oldest.node_id).unwrap();
+        assert_eq!(v.read_file("report.txt").unwrap().as_deref(), Some(b"first draft".as_slice()));
+
+        // Directories and unknown paths have no versions.
+        assert!(v.versions("docs", 10).unwrap().is_empty());
+        assert!(v.versions("never-existed.txt", 10).unwrap().is_empty());
     }
 
     #[test]

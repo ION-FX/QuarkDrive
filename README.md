@@ -117,6 +117,20 @@ pointer. Because storage is content-addressed, a restore never copies
 anything. One honest limit: purging is not a secure erase; the chunks stay
 on disk until object-level garbage collection exists.
 
+## Public links and version history
+
+The share drawer's *Public links* section publishes the folder you are
+browsing at `/s/<id>`: visitors get a read-only page — list, browse,
+download — with no account. A link can require a password (sent in a
+header on every request, never in a URL) and can expire. Removing the
+link cuts off everyone instantly, and a visitor cannot read a single byte
+outside the shared folder.
+
+Every overwrite a file has ever had is a version. The *Versions* button on
+a file walks the snapshot history and lists each distinct content with its
+date and size: download any of them, or restore one to bring those exact
+bytes back. Restores re-use the stored chunks, so they cost nothing.
+
 ## Running it as a service
 
 ```sh
