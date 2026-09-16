@@ -318,6 +318,40 @@ impl Vault {
         Ok(true)
     }
 
+    /// Remove `path` from the tree, handing back the detached node so the
+    /// caller can put it back later. This is what makes the trash cheap:
+    /// only directory objects change, the file's chunks stay exactly where
+    /// they are, so restoring is instant and stores nothing new.
+    pub fn detach(&self, path: &str) -> Result<Option<NodeRef>> {
+        self.require_readable()?;
+        let parts = split_path(path)?;
+        let trees = self.trees();
+        if trees.lookup(&self.root()?, path)?.is_none() {
+            return Ok(None);
+        }
+        let (node_id, node) = self
+            .lookup_id(path)?
+            .ok_or_else(|| anyhow!("no such path: {}", path))?;
+        let node_ref = node.to_ref(node_id);
+        let new_root = set_in_tree(&trees, self.root()?, &parts, None)?;
+        self.commit(new_root, "web")?;
+        Ok(Some(node_ref))
+    }
+
+    /// Put a previously detached node back into the tree. Refuses to
+    /// silently overwrite; the caller picks an unoccupied path.
+    pub fn attach(&self, path: &str, node_ref: NodeRef) -> Result<()> {
+        self.require_readable()?;
+        let parts = split_path(path)?;
+        if self.lookup_id(path)?.is_some() {
+            return Err(anyhow!("{} already exists", path));
+        }
+        let trees = self.trees();
+        let root = set_in_tree(&trees, self.root()?, &parts, Some(node_ref))?;
+        self.commit(root, "web")?;
+        Ok(())
+    }
+
     /// Rename `from`, or move it into a different folder.
     ///
     /// In the tree this is just "detach the entry here, attach it there", so
@@ -580,6 +614,34 @@ mod tests {
         assert!(v.remove("dir").unwrap());
         assert_eq!(names(&v, ""), vec!["keep.txt"]);
         assert!(!v.remove("never-existed").unwrap(), "removing nothing is not an error");
+    }
+
+    #[test]
+    fn detached_nodes_can_be_attached_again() {
+        let (_d, v) = vault("v-trash", false);
+        v.put_file("docs/report.txt", b"quarterly numbers", None).unwrap();
+
+        let node_ref = v.detach("docs/report.txt").unwrap().expect("present");
+        assert!(v.read_file("docs/report.txt").unwrap().is_none());
+        assert!(v.detach("docs/report.txt").unwrap().is_none(), "double detach is None");
+
+        // Restore somewhere else entirely.
+        v.attach("archive/report.txt", node_ref).unwrap();
+        assert_eq!(
+            v.read_file("archive/report.txt").unwrap().as_deref(),
+            Some(b"quarterly numbers".as_slice())
+        );
+
+        // Attaching onto an occupied path is refused.
+        let (id, node) = v.lookup_id("archive/report.txt").unwrap().unwrap();
+        assert!(v.attach("archive/report.txt", node.to_ref(id)).is_err());
+        v.attach("docs/report.txt", node_ref).unwrap();
+
+        assert_eq!(
+            v.read_file("archive/report.txt").unwrap().as_deref(),
+            Some(b"quarterly numbers".as_slice())
+        );
+        assert_eq!(v.read_file("docs/report.txt").unwrap().as_deref(), Some(b"quarterly numbers".as_slice()));
     }
 
     #[test]

@@ -33,8 +33,26 @@ CREATE TABLE IF NOT EXISTS vaults (
     encrypted INTEGER NOT NULL DEFAULT 0,
     created   INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS shares (
+    vault_id  TEXT NOT NULL,
+    user_id   TEXT NOT NULL,
+    role      TEXT NOT NULL,            -- 'read' or 'write'
+    created   INTEGER NOT NULL,
+    PRIMARY KEY (vault_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS trash (
+    id         TEXT PRIMARY KEY,
+    vault_id   TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    node_id    TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    size       INTEGER NOT NULL,
+    deleted_at INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_vaults_owner ON vaults(owner_id);
+CREATE INDEX IF NOT EXISTS idx_shares_user ON shares(user_id);
+CREATE INDEX IF NOT EXISTS idx_trash_vault ON trash(vault_id);
 "#;
 
 #[derive(Debug, Clone)]
@@ -43,6 +61,27 @@ pub struct VaultRow {
     pub name: String,
     pub owner_id: String,
     pub encrypted: bool,
+    pub created: i64,
+}
+
+/// One row of a vault's trash: the detached tree node and where it lived.
+#[derive(Debug, Clone)]
+pub struct TrashRow {
+    pub id: String,
+    pub vault_id: String,
+    pub path: String,
+    pub node_id: String,
+    pub kind: String,
+    pub size: u64,
+    pub deleted_at: i64,
+}
+
+/// A vault shared with a user (`role` is "read" or "write").
+#[derive(Debug, Clone)]
+pub struct ShareRow {
+    pub user_id: String,
+    pub username: String,
+    pub role: String,
     pub created: i64,
 }
 
@@ -346,6 +385,171 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    // ---------------------------------------------------------------- shares
+
+    /// Share a vault with a user. `role` must be "read" or "write".
+    pub fn share_vault(&self, vault_id: &str, user_id: &str, role: &str) -> Result<()> {
+        if role != "read" && role != "write" {
+            return Err(anyhow!("role must be \"read\" or \"write\""));
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO shares (vault_id, user_id, role, created) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(vault_id, user_id) DO UPDATE SET role = excluded.role",
+            params![vault_id, user_id, role, Self::now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn unshare_vault(&self, vault_id: &str, user_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM shares WHERE vault_id = ?1 AND user_id = ?2",
+            params![vault_id, user_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Everyone a vault is shared with, newest first.
+    pub fn shares_for_vault(&self, vault_id: &str) -> Result<Vec<ShareRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT s.user_id, u.username, s.role, s.created
+             FROM shares s JOIN users u ON u.id = s.user_id
+             WHERE s.vault_id = ?1 ORDER BY s.created DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![vault_id], |r| {
+                Ok(ShareRow {
+                    user_id: r.get(0)?,
+                    username: r.get(1)?,
+                    role: r.get(2)?,
+                    created: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The role `user_id` holds on a vault, ignoring ownership.
+    pub fn share_role(&self, vault_id: &str, user_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn.query_row(
+            "SELECT role FROM shares WHERE vault_id = ?1 AND user_id = ?2",
+            params![vault_id, user_id],
+            |r| r.get::<_, String>(0),
+        );
+        match row {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Vaults shared *with* a user, i.e. not owned by them.
+    pub fn list_shared_vaults(&self, user_id: &str) -> Result<Vec<(VaultRow, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT v.id, v.name, v.owner_id, v.encrypted, v.created, s.role
+             FROM shares s JOIN vaults v ON v.id = s.vault_id
+             WHERE s.user_id = ?1 ORDER BY v.name",
+        )?;
+        let rows = stmt
+            .query_map(params![user_id], |r| {
+                Ok((
+                    VaultRow {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        owner_id: r.get(2)?,
+                        encrypted: r.get::<_, i64>(3)? != 0,
+                        created: r.get(4)?,
+                    },
+                    r.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // ----------------------------------------------------------------- trash
+
+    /// Record a detached node. Returns the trash entry id.
+    pub fn trash_insert(
+        &self,
+        vault_id: &str,
+        path: &str,
+        node_id: &str,
+        kind: &str,
+        size: u64,
+    ) -> Result<String> {
+        let id = Self::random_id(12);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO trash (id, vault_id, path, node_id, kind, size, deleted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, vault_id, path, node_id, kind, size as i64, Self::now()],
+        )?;
+        Ok(id)
+    }
+
+    pub fn trash_list(&self, vault_id: &str) -> Result<Vec<TrashRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, vault_id, path, node_id, kind, size, deleted_at
+             FROM trash WHERE vault_id = ?1 ORDER BY deleted_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![vault_id], |r| {
+                Ok(TrashRow {
+                    id: r.get(0)?,
+                    vault_id: r.get(1)?,
+                    path: r.get(2)?,
+                    node_id: r.get(3)?,
+                    kind: r.get(4)?,
+                    size: r.get::<_, i64>(5)? as u64,
+                    deleted_at: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn trash_get(&self, vault_id: &str, id: &str) -> Result<Option<TrashRow>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn.query_row(
+            "SELECT id, vault_id, path, node_id, kind, size, deleted_at
+             FROM trash WHERE vault_id = ?1 AND id = ?2",
+            params![vault_id, id],
+            |r| {
+                Ok(TrashRow {
+                    id: r.get(0)?,
+                    vault_id: r.get(1)?,
+                    path: r.get(2)?,
+                    node_id: r.get(3)?,
+                    kind: r.get(4)?,
+                    size: r.get::<_, i64>(5)? as u64,
+                    deleted_at: r.get(6)?,
+                })
+            },
+        );
+        match row {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Drop a trash entry. The detached node's objects stay in the store
+    /// until object-level garbage collection exists.
+    pub fn trash_remove(&self, vault_id: &str, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM trash WHERE vault_id = ?1 AND id = ?2",
+            params![vault_id, id],
+        )?;
+        Ok(n > 0)
+    }
 }
 
 #[cfg(test)]
@@ -423,5 +627,76 @@ mod tests {
         assert!(db.create_vault("../escape", &a, false).is_err());
         assert!(db.create_vault("a/b", &a, false).is_err());
         assert!(db.create_vault("", &a, false).is_err());
+    }
+
+    #[test]
+    fn shares_round_trip() {
+        let (_d, db) = db("db-share");
+        let owner = db.create_user("ada", "pw").unwrap();
+        let mate = db.create_user("bob", "pw").unwrap();
+        let vault = db.create_vault("photos", &owner, false).unwrap();
+
+        db.share_vault(&vault, &mate, "read").unwrap();
+        assert_eq!(db.share_role(&vault, &mate).unwrap().as_deref(), Some("read"));
+        // Re-sharing upgrades the role in place.
+        db.share_vault(&vault, &mate, "write").unwrap();
+        assert_eq!(db.share_role(&vault, &mate).unwrap().as_deref(), Some("write"));
+
+        let shared = db.list_shared_vaults(&mate).unwrap();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].0.name, "photos");
+        assert_eq!(shared[0].1, "write");
+        // The owner does not see it in *their* shared list.
+        assert!(db.list_shared_vaults(&owner).unwrap().is_empty());
+
+        let rows = db.shares_for_vault(&vault).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].username, "bob");
+
+        assert!(db.unshare_vault(&vault, &mate).unwrap());
+        assert_eq!(db.share_role(&vault, &mate).unwrap(), None);
+        assert!(!db.unshare_vault(&vault, &mate).unwrap());
+    }
+
+    #[test]
+    fn invalid_share_roles_are_rejected() {
+        let (_d, db) = db("db-sharerole");
+        let owner = db.create_user("a", "pw").unwrap();
+        let mate = db.create_user("b", "pw").unwrap();
+        let vault = db.create_vault("v", &owner, false).unwrap();
+        assert!(db.share_vault(&vault, &mate, "admin").is_err());
+        assert!(db.share_vault(&vault, &mate, "").is_err());
+    }
+
+    #[test]
+    fn trash_round_trip() {
+        let (_d, db) = db("db-trash");
+        let owner = db.create_user("a", "pw").unwrap();
+        let vault = db.create_vault("v", &owner, false).unwrap();
+
+        let id = db.trash_insert(&vault, "docs/notes.txt", "abc123", "file", 42).unwrap();
+        let rows = db.trash_list(&vault).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "docs/notes.txt");
+        assert_eq!(rows[0].size, 42);
+
+        let got = db.trash_get(&vault, &id).unwrap().unwrap();
+        assert_eq!(got.node_id, "abc123");
+        assert!(db.trash_get(&vault, "missing").unwrap().is_none());
+
+        assert!(db.trash_remove(&vault, &id).unwrap());
+        assert!(db.trash_list(&vault).unwrap().is_empty());
+        assert!(!db.trash_remove(&vault, &id).unwrap());
+    }
+
+    #[test]
+    fn trash_is_scoped_per_vault() {
+        let (_d, db) = db("db-trashscope");
+        let owner = db.create_user("a", "pw").unwrap();
+        let v1 = db.create_vault("one", &owner, false).unwrap();
+        let v2 = db.create_vault("two", &owner, false).unwrap();
+        db.trash_insert(&v1, "x.txt", "n1", "file", 1).unwrap();
+        assert!(db.trash_list(&v2).unwrap().is_empty());
+        assert!(db.trash_get(&v2, "nope").unwrap().is_none());
     }
 }

@@ -1,0 +1,23 @@
+# Self-hosted Quarkdrive in one file:
+#
+#   docker compose up -d --build
+#
+# Then open http://localhost:8787 and create the first account (or use
+# `docker compose exec quarkdrive quarkdrive-server create-user …`).
+#
+# For HTTPS, put a reverse proxy in front (Caddy, Traefik, nginx) or mount
+# certificates and add:
+#   command: serve --data /data --web /srv/quarkdrive/web --listen 0.0.0.0:8787
+#            --tls-cert /certs/fullchain.pem --tls-key /certs/privkey.pem
+
+services:
+  quarkdrive:
+    build: .
+    ports:
+      - "8787:8787"
+    volumes:
+      - quarkdrive-data:/data
+    restart: unless-stopped
+
+volumes:
+  quarkdrive-data:

@@ -8,6 +8,11 @@ One vault, three kinds of client:
 - **Web** — a browser UI for browsing, uploading and viewing photos
 - **Android** — automatic camera backup plus browsing
 
+And the things that make it a place rather than a folder: **share a vault**
+with another account on the server (view or edit), a **trash** that keeps
+deleted files until they are purged, optional native **HTTPS**, and a login
+**rate limiter** against password guessing.
+
 The backend is Rust. The desktop app is native Rust too (egui) — one static
 binary, no Python, no Electron, no npm. The web UI is hand-written HTML, CSS
 and JavaScript with no npm, no bundler and no build step — the server serves
@@ -96,6 +101,45 @@ Useful flags:
 | `--yes` | Never prompt; requires `--password` |
 | `--start` | Start the server when setup finishes |
 | `--profile debug\|release` | Which build to run |
+
+## Sharing and the trash
+
+A vault owner can invite other accounts on the same server from the web UI
+(the 👝 button in the top bar): *can view* or *can edit*. A shared vault
+appears in the invitee's own vault list, works in every client that speaks
+the file API, and revoking takes effect immediately. Shares are refused for
+end-to-end encrypted vaults — the recipient would have no key.
+
+Deleted files are not destroyed. The web UI (and the API) moves them to a
+per-vault trash: restore puts a file back at its old path — or next to it as
+`name.restored-<time>` if that path is taken again — and purging drops the
+pointer. Because storage is content-addressed, a restore never copies
+anything. One honest limit: purging is not a secure erase; the chunks stay
+on disk until object-level garbage collection exists.
+
+## Running it as a service
+
+```sh
+docker compose up -d --build        # or:
+cargo build --release
+sudo cp target/release/quarkdrive-server /usr/local/bin/
+sudo cp -r web /usr/local/share/quarkdrive/web
+sudo cp deploy/quarkdrive.service /etc/systemd/system/
+sudo systemctl enable --now quarkdrive
+```
+
+For HTTPS, either point a reverse proxy at port 8787 or give the server
+certificates directly:
+
+```sh
+quarkdrive-server serve --data /var/lib/quarkdrive --listen 0.0.0.0:443 \
+    --tls-cert /etc/letsencrypt/live/example.com/fullchain.pem \
+    --tls-key  /etc/letsencrypt/live/example.com/privkey.pem
+```
+
+Repeated failed sign-ins (five inside ten minutes, per source address and
+username) are refused for the rest of the window, so an internet-facing
+server is not wide open to password guessing.
 
 ## Why it is fast
 
@@ -238,8 +282,8 @@ toolchain and `android/build-rust.sh` is unchanged.
 ## Status
 
 Built and verified: the sync engine, the server, the Linux client, the web
-UI's data path, the Android app, the PyQt6 desktop GUI, and the native
-desktop GUI. Two Linux clients
+UI's data path, the Android app, both desktop GUIs, vault sharing, the
+trash, login rate limiting and native HTTPS. Two Linux clients
 were exercised end-to-end against a live server — upload, pull, deletion
 propagation, conflict handling, idle no-ops, and web-API interop. The Android
 APK builds, installs, and was driven against a live server in an emulator:

@@ -1,0 +1,35 @@
+# Systemd unit for a Quarkdrive server.
+#
+#   sudo cp deploy/quarkdrive.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now quarkdrive
+#
+# Expects the binary at /usr/local/bin/quarkdrive-server and the web UI at
+# /usr/local/share/quarkdrive/web (both produced by `scripts/install.sh`
+# or a plain `cargo build --release` + copy). Data lives in /var/lib/quarkdrive.
+
+[Unit]
+Description=Quarkdrive file and photo sync server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=quarkdrive
+ExecStart=/usr/local/bin/quarkdrive-server serve \
+    --data /var/lib/quarkdrive \
+    --web /usr/local/share/quarkdrive/web \
+    --listen 0.0.0.0:8787
+Restart=on-failure
+RestartSec=3
+
+# A file server should not need much of the machine.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/quarkdrive
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

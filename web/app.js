@@ -34,9 +34,14 @@ const state = {
   vault: localStorage.getItem(STORAGE.vault) || '',
   path: '',
   filter: '',
+  /** Server-side search hits, or null when browsing a folder. */
+  searchResults: null,
   entries: [],
   photos: [],
   lightbox: -1,
+  trash: [],
+  /** "owner", "write" or "read" — how this user holds the current vault. */
+  vaultRole: 'owner',
 };
 
 /* ------------------------------------------------------------- helpers */
@@ -233,7 +238,13 @@ async function loadVaults() {
   for (const v of data.vaults) {
     const opt = document.createElement('option');
     opt.value = v.name;
-    opt.textContent = v.encrypted ? `${v.name} (encrypted)` : v.name;
+    if (v.encrypted) {
+      opt.textContent = `${v.name} (encrypted)`;
+    } else if (v.role && v.role !== 'owner') {
+      opt.textContent = `${v.name} (${v.role} share)`;
+    } else {
+      opt.textContent = v.name;
+    }
     select.appendChild(opt);
   }
   if (!data.vaults.some((v) => v.name === state.vault)) {
@@ -241,6 +252,11 @@ async function loadVaults() {
     localStorage.setItem(STORAGE.vault, state.vault);
   }
   select.value = state.vault;
+  const current = data.vaults.find((v) => v.name === state.vault);
+  state.vaultRole = current ? current.role || 'owner' : 'owner';
+  // Only owners can manage shares; the button stays hidden otherwise.
+  const shareBtn = document.getElementById('btn-share');
+  if (shareBtn) shareBtn.hidden = state.vaultRole !== 'owner';
 }
 
 /* -------------------------------------------------------------- files */
@@ -252,6 +268,48 @@ async function loadFiles() {
   renderFiles();
 }
 
+/**
+ * Search the whole vault.
+ *
+ * Filtering the loaded listing can only ever match what is already on screen,
+ * so the server walks the tree instead and finds files in folders the user
+ * has not opened. Results replace the local matches when they arrive.
+ */
+let searchSeq = 0;
+let searchTimer = null;
+
+async function runSearch(term) {
+  const seq = ++searchSeq;
+  try {
+    const data = await (await api(
+      vaultApi(`/search?q=${encodeURIComponent(term)}&limit=200`),
+    )).json();
+    if (seq !== searchSeq) return;
+    state.searchResults = data.entries;
+  } catch (e) {
+    if (seq !== searchSeq) return;
+    // Fall back to the local matches already on screen.
+    state.searchResults = null;
+    toast(`Search failed: ${e.message}`, 'error');
+  }
+  renderFiles();
+}
+
+function onFilterChanged(value) {
+  state.filter = value;
+  const term = value.trim();
+  if (searchTimer) clearTimeout(searchTimer);
+  if (!term) {
+    searchSeq += 1;
+    state.searchResults = null;
+    renderFiles();
+    return;
+  }
+  // Render local matches now so typing stays responsive, then ask the server.
+  renderFiles();
+  searchTimer = setTimeout(() => runSearch(term), 250);
+}
+
 function renderFiles() {
   renderBreadcrumb();
 
@@ -259,16 +317,23 @@ function renderFiles() {
   list.innerHTML = '';
 
   const needle = state.filter.trim().toLowerCase();
-  const visible = needle
-    ? state.entries.filter((e) => e.name.toLowerCase().includes(needle))
-    : state.entries;
+  const searched = needle && state.searchResults !== null;
+  const visible = searched
+    ? state.searchResults
+    : needle
+      ? state.entries.filter((e) => e.name.toLowerCase().includes(needle))
+      : state.entries;
 
   if (!visible.length) {
     const li = document.createElement('li');
     li.className = 'empty';
     if (needle) {
       li.innerHTML = '<span class="empty-icon">🔍</span>';
-      li.appendChild(document.createTextNode(`No matches for “${needle}” in this folder.`));
+      li.appendChild(document.createTextNode(
+        searched
+          ? `No matches for “${needle}” anywhere in this vault.`
+          : `No matches for “${needle}” in this folder.`,
+      ));
     } else {
       li.innerHTML = '<span class="empty-icon">🗃️</span>' +
         'Nothing here yet.<br>Upload a file, or drop one onto this area.';
@@ -297,9 +362,17 @@ function renderFiles() {
 
     const meta = document.createElement('span');
     meta.className = 'entry-meta';
-    meta.textContent = entry.kind === 'dir'
+    const base = entry.kind === 'dir'
       ? 'Folder'
       : `${formatBytes(entry.size)} · ${formatDate(entry.mtime)}`;
+    if (searched) {
+      const parent = entry.path.includes('/')
+        ? entry.path.slice(0, entry.path.lastIndexOf('/'))
+        : '/';
+      meta.textContent = `${base} · in ${parent}`;
+    } else {
+      meta.textContent = base;
+    }
 
     const actions = document.createElement('span');
     actions.className = 'entry-actions';
@@ -331,6 +404,10 @@ function renderFiles() {
   const files = visible.filter((e) => e.kind !== 'dir').length;
   const dirs = visible.length - files;
   const bytes = visible.reduce((sum, e) => sum + (e.size || 0), 0);
+  if (searched) {
+    setStatus(`“${needle}” — ${dirs} folder(s), ${files} file(s) across the vault`);
+    return;
+  }
   const shown = needle ? ` (${visible.length} of ${state.entries.length} shown)` : '';
   setStatus(`${state.path || '/'} — ${dirs} folder(s), ${files} file(s), ` +
     `${formatBytes(bytes)}${shown}`);
@@ -371,6 +448,13 @@ function renderBreadcrumb() {
 }
 
 function navigateTo(path) {
+  if (state.filter) {
+    state.filter = '';
+    state.searchResults = null;
+    searchSeq += 1;
+    const box = $('#filter-input');
+    if (box) box.value = '';
+  }
   state.path = path;
   loadFiles().catch((e) => toast(e.message, 'error'));
 }
@@ -404,16 +488,33 @@ function openFile(entry) {
   downloadFile(entry.path);
 }
 
+/**
+ * Reload after a change.
+ *
+ * The photo timeline is a nice-to-have here: if it fails, the file operation
+ * that just succeeded should not be reported as having failed, so its error
+ * is logged and swallowed rather than thrown.
+ */
+async function refreshAfterChange() {
+  await loadFiles();
+  try {
+    await loadTimeline();
+  } catch (e) {
+    console.warn('timeline refresh failed', e);
+  }
+}
+
 async function removeEntry(entry) {
   const what = entry.kind === 'dir' ? `folder "${entry.name}" and everything in it` : entry.name;
-  if (!window.confirm(`Delete ${what}? This syncs to every device.`)) return;
+  if (!window.confirm(`Delete ${what}? It will go to the trash.`)) return;
   try {
     await api(vaultApi(`/fs?path=${encodeURIComponent(entry.path)}`), { method: 'DELETE' });
     toast(`Deleted ${entry.name}`, 'ok');
-    await Promise.all([loadFiles(), loadTimeline()]);
   } catch (e) {
     toast(`Delete failed: ${e.message}`, 'error');
+    return;
   }
+  await refreshAfterChange();
 }
 
 async function uploadFiles(fileList) {
@@ -435,7 +536,7 @@ async function uploadFiles(fileList) {
     }
   }
   if (done) toast(`Uploaded ${done} file${done === 1 ? '' : 's'}`, 'ok');
-  await Promise.all([loadFiles(), loadTimeline()]);
+  await refreshAfterChange();
 }
 
 async function createFolder() {
@@ -467,10 +568,11 @@ async function renameEntry(entry) {
     await api(vaultApi(`/fs/move?from=${encodeURIComponent(entry.path)}` +
       `&to=${encodeURIComponent(to)}`), { method: 'POST' });
     toast(entry.path === to ? 'Renamed' : `Moved to ${to}`, 'ok');
-    await Promise.all([loadFiles(), loadTimeline()]);
   } catch (e) {
     toast(`Rename failed: ${e.message}`, 'error');
+    return;
   }
+  await refreshAfterChange();
 }
 
 /** Create a vault and switch to it. */
@@ -488,7 +590,7 @@ async function createVault() {
     state.path = '';
     await loadVaults();
     $('#vault-select').value = state.vault;
-    await Promise.all([loadFiles(), loadTimeline()]);
+    await refreshAfterChange();
     toast(`Created vault “${name.trim()}”`, 'ok');
   } catch (e) {
     toast(`Could not create vault: ${e.message}`, 'error');
@@ -620,6 +722,8 @@ function fallbackTile(label) {
 /* ----------------------------------------------------------- lightbox */
 
 let lightboxUrl = null;
+/** Bumped on every navigation so a slow response cannot overwrite a newer one. */
+let lightboxSeq = 0;
 
 async function openLightbox(index) {
   if (index < 0 || index >= state.photos.length) return;
@@ -632,6 +736,10 @@ async function showLightboxImage() {
   const item = state.photos[state.lightbox];
   if (!item) return;
 
+  // Holding the arrow key starts several loads at once; without this a slow
+  // earlier one could land last and leave the wrong photo under the caption.
+  const seq = ++lightboxSeq;
+
   $('#lb-caption').textContent = `${item.path} · ${formatDate(item.taken_at)}`;
   const img = $('#lb-image');
   img.alt = item.path;
@@ -639,15 +747,19 @@ async function showLightboxImage() {
 
   try {
     const res = await api(vaultApi(`/fs/download?path=${encodeURIComponent(item.path)}`));
+    const blob = await res.blob();
+    if (seq !== lightboxSeq) return;
     if (lightboxUrl) URL.revokeObjectURL(lightboxUrl);
-    lightboxUrl = URL.createObjectURL(await res.blob());
+    lightboxUrl = URL.createObjectURL(blob);
     img.src = lightboxUrl;
   } catch (e) {
+    if (seq !== lightboxSeq) return;
     $('#lb-caption').textContent = `Could not load ${item.path}: ${e.message}`;
   }
 }
 
 function closeLightbox() {
+  lightboxSeq += 1;
   $('#lightbox').hidden = true;
   state.lightbox = -1;
   if (lightboxUrl) { URL.revokeObjectURL(lightboxUrl); lightboxUrl = null; }
@@ -989,15 +1101,218 @@ function exportTheme(theme) {
   setTimeout(() => URL.revokeObjectURL(url), 20000);
 }
 
+/* -------------------------------------------------------------- trash */
+
+async function loadTrash() {
+  const data = await (await api(vaultApi('/trash'))).json();
+  state.trash = data.items;
+  renderTrash();
+}
+
+function renderTrash() {
+  const list = document.getElementById('trash-list');
+  if (!list) return;
+  list.innerHTML = '';
+
+  if (!state.trash.length) {
+    const li = document.createElement('li');
+    li.className = 'empty';
+    li.innerHTML = '<span class="empty-icon">🗑️</span>' +
+      'The trash is empty.<br>Deleted files wait here until they are purged.';
+    list.appendChild(li);
+    return;
+  }
+
+  for (const item of state.trash) {
+    const li = document.createElement('li');
+    li.className = 'entry';
+
+    const icon = document.createElement('span');
+    icon.className = 'entry-icon';
+    icon.textContent = item.kind === 'dir' ? '📁' : '📄';
+
+    const name = document.createElement('span');
+    name.className = 'entry-name';
+    name.textContent = item.path;
+    name.title = `deleted ${new Date(item.deleted_at * 1000).toLocaleString()}`;
+
+    const meta = document.createElement('span');
+    meta.className = 'entry-meta muted';
+    meta.textContent = item.kind === 'dir' ? 'folder' : formatBytes(item.size);
+
+    const restore = document.createElement('button');
+    restore.className = 'ghost';
+    restore.textContent = 'Restore';
+    restore.addEventListener('click', () => restoreFromTrash(item.id));
+
+    const purge = document.createElement('button');
+    purge.className = 'danger';
+    purge.textContent = 'Delete forever';
+    purge.addEventListener('click', () => purgeTrashItem(item));
+
+    li.append(icon, name, meta, restore, purge);
+    list.appendChild(li);
+  }
+}
+
+async function restoreFromTrash(id) {
+  try {
+    const res = await api(
+      `/api/v1/vaults/${encodeURIComponent(state.vault)}/trash/restore?id=${encodeURIComponent(id)}`,
+      { method: 'POST' },
+    );
+    const data = await res.json();
+    toast(`Restored to ${data.path}`, 'ok');
+  } catch (e) {
+    toast(`Restore failed: ${e.message}`, 'error');
+  }
+  await loadTrash().catch(() => {});
+}
+
+async function purgeTrashItem(item) {
+  if (!window.confirm(`Delete forever ${item.path}? This cannot be undone.`)) return;
+  try {
+    await api(vaultApi(`/trash?id=${encodeURIComponent(item.id)}`), { method: 'DELETE' });
+    toast(`Purged ${item.path}`, 'ok');
+  } catch (e) {
+    toast(`Purge failed: ${e.message}`, 'error');
+    return;
+  }
+  await loadTrash().catch(() => {});
+}
+
+async function emptyTrash() {
+  if (!window.confirm('Delete forever everything in the trash? This cannot be undone.')) return;
+  try {
+    await api(vaultApi('/trash?all=true'), { method: 'DELETE' });
+    toast('Trash emptied', 'ok');
+  } catch (e) {
+    toast(`Emptying the trash failed: ${e.message}`, 'error');
+    return;
+  }
+  await loadTrash().catch(() => {});
+}
+
+/* ------------------------------------------------------------ sharing */
+
+function openShareDrawer() {
+  const drawer = document.getElementById('share-drawer');
+  const scrim = document.getElementById('share-scrim');
+  if (!drawer || !scrim) return;
+  drawer.hidden = false;
+  scrim.hidden = false;
+  const label = document.getElementById('share-vault-name');
+  if (label) label.textContent = `Vault “${state.vault}” — invite someone by username.`;
+  loadShares().catch((e) => {
+    const err = document.getElementById('share-error');
+    if (err) {
+      err.textContent = e.message;
+      err.hidden = false;
+    }
+  });
+}
+
+function closeShareDrawer() {
+  const drawer = document.getElementById('share-drawer');
+  const scrim = document.getElementById('share-scrim');
+  if (drawer) drawer.hidden = true;
+  if (scrim) scrim.hidden = true;
+}
+
+async function loadShares() {
+  const data = await (await api(`/api/v1/vaults/${encodeURIComponent(state.vault)}/shares`)).json();
+  const list = document.getElementById('share-list');
+  if (!list) return;
+  list.innerHTML = '';
+
+  if (!data.shares.length) {
+    const li = document.createElement('li');
+    li.className = 'empty';
+    li.textContent = 'Not shared with anyone yet.';
+    list.appendChild(li);
+    return;
+  }
+
+  for (const share of data.shares) {
+    const li = document.createElement('li');
+    li.className = 'entry';
+
+    const icon = document.createElement('span');
+    icon.className = 'entry-icon';
+    icon.textContent = '👤';
+
+    const name = document.createElement('span');
+    name.className = 'entry-name';
+    name.textContent = share.username;
+
+    const meta = document.createElement('span');
+    meta.className = 'entry-meta muted';
+    meta.textContent = share.role === 'write' ? 'can edit' : 'can view';
+
+    const revoke = document.createElement('button');
+    revoke.className = 'danger';
+    revoke.textContent = 'Revoke';
+    revoke.addEventListener('click', () => revokeShare(share.username));
+
+    li.append(icon, name, meta, revoke);
+    list.appendChild(li);
+  }
+}
+
+async function addShare() {
+  const err = document.getElementById('share-error');
+  const input = document.getElementById('share-user');
+  if (err) err.hidden = true;
+  const username = input ? input.value.trim() : '';
+  if (!username) return;
+  const role = document.getElementById('share-role').value;
+  try {
+    await api(`/api/v1/vaults/${encodeURIComponent(state.vault)}/shares`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, role }),
+    });
+    if (input) input.value = '';
+    toast(`Shared with ${username}`, 'ok');
+  } catch (e) {
+    if (err) {
+      err.textContent = e.message;
+      err.hidden = false;
+    }
+    return;
+  }
+  await loadShares().catch(() => {});
+}
+
+async function revokeShare(username) {
+  try {
+    await api(
+      `/api/v1/vaults/${encodeURIComponent(state.vault)}/shares/${encodeURIComponent(username)}`,
+      { method: 'DELETE' },
+    );
+    toast(`No longer shared with ${username}`, 'ok');
+  } catch (e) {
+    toast(`Revoke failed: ${e.message}`, 'error');
+    return;
+  }
+  await loadShares().catch(() => {});
+}
+
 /* ------------------------------------------------------------ wiring */
 
 function selectTab(which) {
-  $('#tab-files').classList.toggle('active', which === 'files');
-  $('#tab-photos').classList.toggle('active', which === 'photos');
-  $('#tab-files').setAttribute('aria-selected', String(which === 'files'));
-  $('#tab-photos').setAttribute('aria-selected', String(which === 'photos'));
-  $('#files-view').hidden = which !== 'files';
-  $('#photos-view').hidden = which !== 'photos';
+  // Guarded lookups throughout: an older cached page without the trash
+  // markup must still switch between files and photos.
+  for (const t of ['files', 'photos', 'trash']) {
+    const btn = document.getElementById(`tab-${t}`);
+    if (btn) {
+      btn.classList.toggle('active', which === t);
+      btn.setAttribute('aria-selected', String(which === t));
+    }
+    const pane = document.getElementById(`${t}-view`);
+    if (pane) pane.hidden = which !== t;
+  }
+  if (which === 'trash') loadTrash().catch((e) => toast(e.message, 'error'));
 }
 
 async function start() {
@@ -1195,19 +1510,44 @@ function init() {
 
   $('#tab-files').addEventListener('click', () => selectTab('files'));
   $('#tab-photos').addEventListener('click', () => selectTab('photos'));
+  const tabTrash = document.getElementById('tab-trash');
+  if (tabTrash) tabTrash.addEventListener('click', () => selectTab('trash'));
+  const btnShare = document.getElementById('btn-share');
+  if (btnShare) btnShare.addEventListener('click', openShareDrawer);
+  const shareClose = document.getElementById('share-close');
+  if (shareClose) shareClose.addEventListener('click', closeShareDrawer);
+  const shareScrim = document.getElementById('share-scrim');
+  if (shareScrim) shareScrim.addEventListener('click', closeShareDrawer);
+  const btnAddShare = document.getElementById('btn-add-share');
+  if (btnAddShare) btnAddShare.addEventListener('click', () => addShare().catch(() => {}));
+  const shareUser = document.getElementById('share-user');
+  if (shareUser) {
+    shareUser.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        addShare().catch(() => {});
+      }
+    });
+  }
+  const btnEmptyTrash = document.getElementById('btn-empty-trash');
+  if (btnEmptyTrash) btnEmptyTrash.addEventListener('click', emptyTrash);
 
   $('#btn-upload').addEventListener('click', () => $('#file-input').click());
   $('#file-input').addEventListener('change', (ev) => {
-    uploadFiles(ev.target.files);
+    // A live FileList empties when the input is reset, so copy it first.
+    const files = Array.from(ev.target.files);
     ev.target.value = '';
+    uploadFiles(files).catch((e) => toast(`Upload failed: ${e.message}`, 'error'));
   });
   $('#btn-newfolder').addEventListener('click', createFolder);
   $('#btn-new-vault').addEventListener('click', createVault);
 
-  $('#filter-input').addEventListener('input', (ev) => {
-    state.filter = ev.target.value;
-    renderFiles();
-  });
+  $('#filter-input').addEventListener('input', (ev) => onFilterChanged(ev.target.value));
+
+  // Without this the browser opens a file dropped anywhere else on the page,
+  // navigating away from the app and losing whatever was in progress.
+  ['dragover', 'drop'].forEach((type) =>
+    document.addEventListener(type, (ev) => ev.preventDefault()));
 
   const zone = $('#dropzone');
   const hint = $('#drop-hint');

@@ -195,6 +195,124 @@ fi
 expect "$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" "$SRV/api/v1/vaults/safe/fs?path=")" \
   "400" "file API refuses an encrypted vault"
 
+echo "== vault sharing =="
+"$BIN/quarkdrive-server" create-user  --data "$DATA" --username bob   --password 'builder-7' >/dev/null
+"$BIN/quarkdrive-server" create-user  --data "$DATA" --username carol --password 'singer-8'  >/dev/null
+BOB_TOKEN=$("$BIN/quarkdrive-server" create-token --data "$DATA" --username bob | tail -1)
+CAROL_TOKEN=$("$BIN/quarkdrive-server" create-token --data "$DATA" --username carol | tail -1)
+bob_auth=(-H "Authorization: Bearer $BOB_TOKEN")
+carol_auth=(-H "Authorization: Bearer $CAROL_TOKEN")
+
+curl -sf -X POST "${auth[@]}" "$SRV/api/v1/vaults/photos/shares" \
+  -H 'content-type: application/json' -d '{"username":"bob","role":"write"}' >/dev/null
+pass "owner shared the vault with bob (write)"
+curl -sf -X POST "${auth[@]}" "$SRV/api/v1/vaults/photos/shares" \
+  -H 'content-type: application/json' -d '{"username":"carol","role":"read"}' >/dev/null
+pass "owner shared the vault with carol (read)"
+
+role=$(curl -s "${bob_auth[@]}" "$SRV/api/v1/vaults" | python3 -c "
+import json,sys
+vs = json.load(sys.stdin)['vaults']
+print(next(v['role'] for v in vs if v['name'] == 'photos'))")
+expect "$role" "write" "shared vault appears in bob's list with the right role"
+
+expect "$(curl -s -o /dev/null -w '%{http_code}' "${bob_auth[@]}" "$SRV/api/v1/vaults/photos/fs?path=")" \
+  "200" "write-share can list"
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${bob_auth[@]}" --data-binary 'from bob' \
+         "$SRV/api/v1/vaults/photos/fs?path=bob.txt")" \
+  "200" "write-share can upload"
+expect "$(curl -s -o /dev/null -w '%{http_code}' "${carol_auth[@]}" "$SRV/api/v1/vaults/photos/fs?path=")" \
+  "200" "read-share can list"
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${carol_auth[@]}" --data-binary 'nope' \
+         "$SRV/api/v1/vaults/photos/fs?path=carol.txt")" \
+  "403" "read-share cannot upload"
+expect "$(curl -s -o /dev/null -w '%{http_code}' "${bob_auth[@]}" "$SRV/api/v1/vaults/photos/shares")" \
+  "403" "sharee cannot manage shares"
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X POST "${auth[@]}" "$SRV/api/v1/vaults/photos/shares" \
+         -H 'content-type: application/json' -d '{"username":"ghost","role":"read"}')" \
+  "404" "sharing with an unknown user fails"
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X POST "${auth[@]}" "$SRV/api/v1/vaults/safe/shares" \
+         -H 'content-type: application/json' -d '{"username":"bob","role":"read"}')" \
+  "400" "encrypted vaults cannot be shared"
+
+curl -sf -X DELETE "${auth[@]}" "$SRV/api/v1/vaults/photos/shares/bob" >/dev/null
+expect "$(curl -s -o /dev/null -w '%{http_code}' "${bob_auth[@]}" "$SRV/api/v1/vaults/photos/fs?path=")" \
+  "404" "revoked share loses access, indistinguishable from no vault"
+
+echo "== trash: delete, restore, purge =="
+curl -sf -X PUT "${auth[@]}" --data-binary 'the quarterly report' \
+     "$SRV/api/v1/vaults/photos/fs?path=report.txt" >/dev/null
+curl -sf -X DELETE "${auth[@]}" "$SRV/api/v1/vaults/photos/fs?path=report.txt" >/dev/null
+expect "$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" "$SRV/api/v1/vaults/photos/fs/download?path=report.txt")" \
+  "404" "deleted file is gone from the vault"
+TRASH_ID=$(curl -s "${auth[@]}" "$SRV/api/v1/vaults/photos/trash" | python3 -c "
+import json,sys
+items = json.load(sys.stdin)['items']
+print(items[0]['id'] if items else '')")
+if [[ -n "$TRASH_ID" ]]; then
+  pass "deleted file is listed in the trash"
+else
+  fail "trash is empty after a delete"
+fi
+RESTORED=$(curl -s -X POST "${auth[@]}" "$SRV/api/v1/vaults/photos/trash/restore?id=$TRASH_ID")
+expect "$(printf '%s' "$RESTORED" | python3 -c "import json,sys; print(json.load(sys.stdin).get('path',''))")" \
+  "report.txt" "restore puts the file back at its old path"
+expect "$(curl -s "${auth[@]}" "$SRV/api/v1/vaults/photos/fs/download?path=report.txt")" \
+  "the quarterly report" "restored bytes are identical"
+
+# Deleting again while the path is occupied restores under a new name.
+curl -sf -X DELETE "${auth[@]}" "$SRV/api/v1/vaults/photos/fs?path=report.txt" >/dev/null
+curl -sf -X PUT "${auth[@]}" --data-binary 'replaced' \
+     "$SRV/api/v1/vaults/photos/fs?path=report.txt" >/dev/null
+TRASH_ID2=$(curl -s "${auth[@]}" "$SRV/api/v1/vaults/photos/trash" | python3 -c "
+import json,sys; print(json.load(sys.stdin)['items'][0]['id'])")
+RESTORED2=$(curl -s -X POST "${auth[@]}" "$SRV/api/v1/vaults/photos/trash/restore?id=$TRASH_ID2")
+case "$RESTORED2" in
+  *".restored-"*) pass "restore renames around an occupied path";;
+  *) fail "restore into an occupied path: $RESTORED2";;
+esac
+
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "${carol_auth[@]}" "$SRV/api/v1/vaults/photos/trash?all=true")" \
+  "403" "read-only share cannot purge the trash"
+curl -sf -X DELETE "${auth[@]}" "$SRV/api/v1/vaults/photos/trash?all=true" >/dev/null
+count=$(curl -s "${auth[@]}" "$SRV/api/v1/vaults/photos/trash" | python3 -c "import json,sys; print(len(json.load(sys.stdin)['items']))")
+expect "$count" "0" "purge empties the trash"
+
+echo "== login rate limiting =="
+for i in 1 2 3 4 5 6; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$SRV/api/v1/auth/login" \
+    -H 'content-type: application/json' -d '{"username":"carol","password":"wrong"}')
+  case "$i" in
+    1|2|3|4|5) expect "$code" "401" "bad login $i rejected";;
+    6)         expect "$code" "429" "sixth attempt is rate-limited";;
+  esac
+done
+expect "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$SRV/api/v1/auth/login" \
+  -H 'content-type: application/json' -d '{"username":"carol","password":"singer-8"}')" \
+  "429" "the correct password is also refused while locked out"
+
+echo "== HTTPS (TLS) =="
+# A second server process on the same data, behind a self-signed cert.
+TLS_PORT="${TLS_PORT:-8898}"
+openssl req -x509 -newkey rsa:2048 -keyout "$WORK/key.pem" -out "$WORK/cert.pem" \
+  -days 2 -nodes -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" 2>/dev/null
+"$BIN/quarkdrive-server" serve --data "$DATA" --listen "127.0.0.1:$TLS_PORT" \
+  --tls-cert "$WORK/cert.pem" --tls-key "$WORK/key.pem" >"$WORK/tls.log" 2>&1 &
+TLS_PID=$!
+for _ in $(seq 1 60); do
+  curl -sfk "https://127.0.0.1:$TLS_PORT/api/v1/health" >/dev/null 2>&1 && break
+  sleep 0.25
+done
+expect "$(curl -sfk "https://127.0.0.1:$TLS_PORT/api/v1/health" | grep -o '"ok":true')" \
+  '"ok":true' "server serves HTTPS"
+subject=$(echo | openssl s_client -connect "127.0.0.1:$TLS_PORT" 2>/dev/null | \
+  openssl x509 -noout -subject 2>/dev/null)
+case "$subject" in
+  *CN*localhost*) pass "TLS handshake presents the certificate";;
+  *) fail "could not verify TLS handshake: $subject";;
+esac
+kill "$TLS_PID" 2>/dev/null
+
 echo
 if [[ -z "$FAILED" ]]; then
   echo "ALL END-TO-END CHECKS PASSED"

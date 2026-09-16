@@ -101,7 +101,7 @@ function makeStorage() {
   };
 }
 
-function makeFetch(calls, { firstRun }) {
+function makeFetch(calls, { firstRun, shareRole = 'owner' }) {
   return function fetch(url) {
     url = String(url);
     calls.push(url);
@@ -110,28 +110,54 @@ function makeFetch(calls, { firstRun }) {
       console.log(new Error().stack.split('\n').slice(1, 6).join('\n'));
     }
     let body = {};
-    if (url.includes('/auth/status')) body = { first_run: firstRun };
+    if (url.includes('/search')) {
+      body = {
+        path: '',
+        entries: [
+          {
+            name: 'holiday.jpg',
+            path: 'photos/2024/holiday.jpg',
+            kind: 'file',
+            size: 1024,
+            mtime: 0,
+          },
+        ],
+      };
+    } else if (url.includes('/auth/status')) body = { first_run: firstRun };
     else if (url.includes('/auth/login')) body = { token: 'tok-login', user_id: 'u1' };
     else if (url.includes('/auth/register')) body = { token: 'tok-reg', user_id: 'u2', vault: 'myvault' };
     else if (url.includes('/whoami')) body = { user: 'ada' };
     else if (url.includes('/timeline')) body = { items: [] };
     else if (url.includes('/stats')) body = { files: 0, dirs: 1, symlinks: 0, bytes: 0 };
-    else if (url.includes('/fs')) body = { path: '', entries: [] };
-    else if (url.includes('/vaults')) body = { vaults: [{ name: 'myvault', encrypted: false }] };
+    else if (url.includes('/trash/restore')) body = { ok: true, path: 'old.txt' };
+    else if (url.includes('/trash')) {
+      body = /trash\?/.test(url)
+        ? { ok: true }
+        : { items: [{ id: 't1', path: 'old.txt', kind: 'file', size: 5, deleted_at: 0 }] };
+    } else if (url.includes('/shares')) {
+      body = /shares\/[^/?]+$/.test(url.split('?')[0]) && url.split('?')[0].endsWith('/shares') === false
+        ? { ok: true }
+        : { shares: [{ username: 'bob', role: 'write', created: 0 }] };
+    } else if (url.includes('/fs')) body = { path: '', entries: [] };
+    else if (url.includes('/vaults')) {
+      body = { vaults: [{ name: 'myvault', encrypted: false, role: shareRole }] };
+    }
     return Promise.resolve({
       ok: true,
       status: 200,
       json: () => Promise.resolve(body),
+      blob: () => Promise.resolve({ size: 0, type: 'image/jpeg' }),
     });
   };
 }
 
-async function boot({ includeSignup = true, firstRun = false } = {}) {
+async function boot({ includeSignup = true, firstRun = false, shareRole = 'owner' } = {}) {
   const calls = [];
   const dom = makeDom({ includeSignup });
   const storage = makeStorage();
   let domReady = null;
 
+  const docEvents = {};
   const documentStub = {
     documentElement: makeEl('html'),
     body: makeEl('body'),
@@ -139,7 +165,10 @@ async function boot({ includeSignup = true, firstRun = false } = {}) {
     getElementById: (id) => dom.byId(id),
     createElement: (tag) => makeEl(tag),
     createTextNode: (text) => ({ text }),
-    addEventListener(type, fn) { if (type === 'DOMContentLoaded') domReady = fn; },
+    addEventListener(type, fn) {
+      if (type === 'DOMContentLoaded') domReady = fn;
+      (docEvents[type] = docEvents[type] || []).push(fn);
+    },
   };
   const windowStub = {
     location: { origin: 'http://stub:8787' },
@@ -151,7 +180,7 @@ async function boot({ includeSignup = true, firstRun = false } = {}) {
 
   const run = (source) => new Function(
     'window', 'document', 'localStorage', 'fetch', 'URL', 'QuarkdriveThemes', source,
-  )(windowStub, documentStub, storage, makeFetch(calls, { firstRun }), URLStub,
+  )(windowStub, documentStub, storage, makeFetch(calls, { firstRun, shareRole }), URLStub,
     windowStub.QuarkdriveThemes);
 
   run(themesSource); // themes.js first, as index.html loads it
@@ -163,7 +192,7 @@ async function boot({ includeSignup = true, firstRun = false } = {}) {
   await tick();
   await tick();
 
-  return { dom, calls, storage };
+  return { dom, calls, storage, docEvents };
 }
 
 /* --------------------------------------------------------- assertions */
@@ -186,6 +215,13 @@ function section(name) {
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 25));
+
+function buttonByText(el, text) {
+  return (el.children || []).find(
+    (c) => c.textContent === text && c.events && c.events.click,
+  );
+}
+
 
 async function main() {
   section('boot on a normal server (accounts exist)');
@@ -273,6 +309,96 @@ async function main() {
       !calls.some((u) => u.includes('/auth/register')));
   }
 
+  section('trash: listing, restore, purge guards');
+
+  {
+    const { dom, calls } = await boot({ includeSignup: true, firstRun: false });
+    dom.byId('#login-server').value = 'http://srv:8787';
+    dom.byId('#login-username').value = 'ada';
+    dom.byId('#login-password').value = 'hunter22';
+    dom.byId('#login-form').fire('submit');
+    await tick(); await tick();
+
+    dom.byId('#tab-trash').fire('click');
+    await tick(); await tick();
+    check('trash tab shows the deleted file',
+      (dom.byId('#trash-list').innerHTML || '').includes('old.txt') ||
+      (dom.byId('#trash-list').children[0] || {}).className === 'entry');
+    check('trash request went to the vault trash endpoint',
+      calls.some((u) => u.includes('/vaults/myvault/trash')));
+
+    const row = dom.byId('#trash-list').children[0];
+    const restore = buttonByText(row, 'Restore');
+    check('row offers Restore', Boolean(restore));
+    restore.fire('click');
+    await tick(); await tick();
+    check('restore hits the restore endpoint',
+      calls.some((u) => u.includes('/trash/restore')));
+
+    const purge = buttonByText(row, 'Delete forever');
+    check('row offers Delete forever', Boolean(purge));
+    purge.fire('click');
+    await tick();
+    check('purge is refused when confirm() says no',
+      !calls.some((u) => /trash\?id=/.test(u)));
+
+    dom.byId('#btn-empty-trash').fire('click');
+    await tick();
+    check('empty-trash is also guarded by confirm()',
+      !calls.some((u) => /trash\?all=true/.test(u)));
+  }
+
+  section('sharing: drawer, invite, revoke, owner-only button');
+
+  {
+    const { dom, calls } = await boot({ includeSignup: true, firstRun: false });
+    dom.byId('#login-server').value = 'http://srv:8787';
+    dom.byId('#login-username').value = 'ada';
+    dom.byId('#login-password').value = 'hunter22';
+    dom.byId('#login-form').fire('submit');
+    await tick(); await tick();
+
+    check('share button visible for the owner',
+      dom.byId('#btn-share').hidden === false);
+    dom.byId('#btn-share').fire('click');
+    await tick(); await tick();
+    check('share drawer opens', dom.byId('#share-drawer').hidden === false);
+    check('existing shares are fetched',
+      calls.some((u) => u.includes('/vaults/myvault/shares')));
+
+    dom.byId('#share-user').value = 'carol';
+    dom.byId('#btn-add-share').fire('click');
+    await tick(); await tick();
+    check('invite posted to the shares endpoint',
+      calls.filter((u) => u.includes('/shares')).length >= 1);
+
+    const row = dom.byId('#share-list').children[0];
+    const revoke = buttonByText(row, 'Revoke');
+    check('share row offers Revoke', Boolean(revoke));
+    revoke.fire('click');
+    await tick(); await tick();
+    check('revoke deletes the share',
+      calls.some((u) => /shares\/bob/.test(u)));
+
+    dom.byId('#share-close').fire('click');
+    check('drawer closes', dom.byId('#share-drawer').hidden === true);
+  }
+
+  section('a read-only share hides the share button');
+
+  {
+    const { dom } = await boot({ includeSignup: true, firstRun: false, shareRole: 'read' });
+    dom.byId('#login-server').value = 'http://srv:8787';
+    dom.byId('#login-username').value = 'carol';
+    dom.byId('#login-password').value = 'singer-8';
+    dom.byId('#login-form').fire('submit');
+    await tick(); await tick();
+    check('share button hidden for a read-only sharee',
+      dom.byId('#btn-share').hidden === true);
+    check('vault dropdown marks the shared vault',
+      dom.byId('#vault-select').children.some((o) => (o.textContent || '').includes('read share')));
+  }
+
   section('stale page: new script against cached old markup');
 
   {
@@ -308,7 +434,58 @@ async function main() {
     }
   }
 
+  section('search asks the server, not just the loaded folder');
+  {
+    const { dom, calls, docEvents } = await boot({ includeSignup: true, firstRun: false });
+    dom.byId('#login-server').value = 'http://srv:8787';
+    dom.byId('#login-username').value = 'ada';
+    dom.byId('#login-password').value = 'hunter22';
+    dom.byId('#login-form').fire('submit');
+    await tick();
+
+    const before = calls.length;
+    const box = dom.byId('#filter-input');
+    box.value = 'holiday';
+    box.fire('input');
+
+    // Local matches render immediately; the server is asked after a debounce.
+    check('typing does not hit the server on every keystroke',
+      !calls.slice(before).some((u) => u.includes('/search')));
+
+    await new Promise((r) => setTimeout(r, 400));
+
+    const search = calls.find((u) => u.includes('/search'));
+    check('a search request is sent after the debounce', Boolean(search),
+      `calls: ${calls.slice(before).join(', ') || 'none'}`);
+    check('the typed term is passed to the server',
+      Boolean(search) && search.includes('q=holiday'), search);
+
+    // A hit in a folder the user never opened is the whole point: filtering
+    // the current listing could not have found this one.
+    const list = dom.byId('#entry-list');
+    const rendered = JSON.stringify(list.children);
+    check('a result from another folder is rendered',
+      rendered.includes('holiday.jpg'),
+      rendered.slice(0, 200));
+
+    check('the drop guard is registered on the document',
+      Array.isArray(docEvents.drop) && Array.isArray(docEvents.dragover));
+
+    // Dropping a file outside the zone must be cancelled, or the browser
+    // navigates away from the app.
+    let prevented = false;
+    for (const fn of docEvents.drop || []) {
+      fn({ preventDefault() { prevented = true; }, target: documentStubTarget() });
+    }
+    check('a drop anywhere on the page is cancelled', prevented);
+  }
+
   return finish();
+}
+
+/** A drop target that is not the upload zone. */
+function documentStubTarget() {
+  return { sel: 'somewhere-else' };
 }
 
 function finish() {

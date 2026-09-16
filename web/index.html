@@ -89,11 +89,13 @@ try {
     <nav class="tabs" role="tablist">
       <button id="tab-files"  class="tab active" role="tab" aria-selected="true">Files</button>
       <button id="tab-photos" class="tab"        role="tab" aria-selected="false">Photos</button>
+      <button id="tab-trash"  class="tab"        role="tab" aria-selected="false">Trash</button>
     </nav>
 
     <div class="topbar-right">
       <select id="vault-select" class="vault-select" title="Vault"></select>
       <button id="btn-new-vault" class="icon-btn" title="New vault" aria-label="New vault">＋</button>
+      <button id="btn-share" class="icon-btn" title="Sharing" aria-label="Sharing" hidden>👥</button>
       <button id="btn-theme" class="icon-btn" title="Themes" aria-label="Themes">🎨</button>
       <button id="logout" class="ghost" title="Sign out">Sign out</button>
     </div>
@@ -123,8 +125,50 @@ try {
     <div id="timeline" class="timeline" aria-live="polite"></div>
   </div>
 
+  <!-- trash -->
+  <div id="trash-view" class="pane" hidden>
+    <div class="toolbar">
+      <span class="muted">Deleted files stay here until they are purged.</span>
+      <div class="toolbar-actions">
+        <button id="btn-empty-trash" class="danger">Empty trash</button>
+      </div>
+    </div>
+    <ul id="trash-list" class="entry-list" aria-live="polite"></ul>
+  </div>
+
   <footer id="statusbar" class="statusbar panel"></footer>
 </section>
+
+<!-- ------------------------------------------------------ share drawer -->
+<div id="share-scrim" class="scrim" hidden></div>
+<aside id="share-drawer" class="drawer" hidden role="dialog" aria-label="Sharing">
+  <div class="drawer-head">
+    <h2>Sharing</h2>
+    <button id="share-close" class="icon-btn" aria-label="Close sharing">✕</button>
+  </div>
+
+  <div class="drawer-body">
+    <p class="hint" id="share-vault-name" style="margin:0 0 12px"></p>
+
+    <div class="drawer-row">
+      <input id="share-user" type="text" placeholder="username" maxlength="40" aria-label="Username">
+      <select id="share-role" aria-label="Permission">
+        <option value="read">can view</option>
+        <option value="write">can edit</option>
+      </select>
+      <button id="btn-add-share" class="primary">Invite</button>
+    </div>
+    <p id="share-error" class="error" role="alert" hidden></p>
+
+    <ul id="share-list" class="entry-list" style="margin-top:12px"></ul>
+
+    <p class="hint">
+      People you invite see the vault in their own list. Only the owner can
+      manage shares, and end-to-end encrypted vaults cannot be shared — the
+      recipient has no key.
+    </p>
+  </div>
+</aside>
 
 <!-- ------------------------------------------------------ theme drawer -->
 <div id="theme-scrim" class="scrim" hidden></div>

@@ -13,6 +13,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};
 
+/// Thumbnail fetches allowed in flight at once.
+///
+/// The photo grid draws every cell it has, so this is what keeps a large
+/// timeline from starting hundreds of threads and connections in one frame.
+const MAX_THUMB_JOBS: usize = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Files,
@@ -56,6 +62,13 @@ pub struct Config {
     pub server: String,
     pub username: String,
     pub vault: String,
+    /// Keys this app does not know about.
+    ///
+    /// The Python desktop client shares this file and keeps its token here.
+    /// Round-tripping unknown keys stops a save from silently signing that
+    /// client out.
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 fn config_path() -> Option<std::path::PathBuf> {
@@ -132,6 +145,12 @@ pub struct App {
     pub photos: Option<Result<Vec<Photo>, String>>,
     pub thumbs: HashMap<String, TextureHandle>,
     pub thumb_pending: HashSet<String>,
+    /// Thumbnails the server could not produce. Remembering the failure is
+    /// what stops the grid asking again on every single frame.
+    pub thumb_failed: HashSet<String>,
+    /// Thumbnail fetches in flight. Counted separately from `busy` so a
+    /// loading grid never disables the toolbar.
+    pub thumb_jobs: usize,
     pub preview: Option<(String, TextureHandle)>,
 
     /// (is_error, message) shown in the status bar.
@@ -178,6 +197,8 @@ impl App {
             photos: None,
             thumbs: HashMap::new(),
             thumb_pending: HashSet::new(),
+            thumb_failed: HashSet::new(),
+            thumb_jobs: 0,
             preview: None,
             note: None,
             config,
@@ -192,7 +213,11 @@ impl App {
     /// Drain finished worker results; called once per frame.
     pub fn poll(&mut self) {
         while let Ok(ev) = self.rx.try_recv() {
-            self.busy = self.busy.saturating_sub(1);
+            if matches!(ev, Event::Thumb { .. }) {
+                self.thumb_jobs = self.thumb_jobs.saturating_sub(1);
+            } else {
+                self.busy = self.busy.saturating_sub(1);
+            }
             self.handle(ev);
         }
     }
@@ -305,9 +330,19 @@ impl App {
             Event::Timeline(res) => self.photos = Some(res),
             Event::Thumb { path, img } => {
                 self.thumb_pending.remove(&path);
-                if let Ok(img) = img {
-                    if let Some(tex) = self.make_texture(&format!("thumb:{path}"), img) {
-                        self.thumbs.insert(path, tex);
+                match img {
+                    Ok(img) => match self.make_texture(&format!("thumb:{path}"), img) {
+                        Some(tex) => {
+                            self.thumbs.insert(path, tex);
+                        }
+                        // No context yet, so the texture could not be built.
+                        // Leave it un-failed and let a later frame retry.
+                        None => {}
+                    },
+                    // Without this the cell would ask again next frame, and
+                    // the frame after that, for as long as the grid is shown.
+                    Err(_) => {
+                        self.thumb_failed.insert(path);
                     }
                 }
             }
@@ -335,6 +370,19 @@ impl App {
     {
         let tx = self.tx.clone();
         self.busy += 1;
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+        });
+    }
+
+    /// Like [`App::spawn`], but for thumbnail fetches, which are many and
+    /// individually unimportant: they must not gate the toolbar on `busy`.
+    fn spawn_thumb<F>(&mut self, job: F)
+    where
+        F: FnOnce() -> Event + Send + 'static,
+    {
+        let tx = self.tx.clone();
+        self.thumb_jobs += 1;
         std::thread::spawn(move || {
             let _ = tx.send(job());
         });
@@ -416,6 +464,7 @@ impl App {
         self.photos = None;
         self.thumbs.clear();
         self.thumb_pending.clear();
+        self.thumb_failed.clear();
         self.preview = None;
         self.cwd.clear();
         self.listing = Listing::Dir;
@@ -437,6 +486,7 @@ impl App {
         self.photos = None;
         self.thumbs.clear();
         self.thumb_pending.clear();
+        self.thumb_failed.clear();
         self.preview = None;
         self.refresh();
     }
@@ -656,14 +706,23 @@ impl App {
 
     /// The photo grid calls this for cells that scrolled into view.
     pub fn request_thumb(&mut self, path: &str) {
-        if self.thumbs.contains_key(path) || self.thumb_pending.contains(path) {
+        if self.thumbs.contains_key(path)
+            || self.thumb_pending.contains(path)
+            || self.thumb_failed.contains(path)
+        {
+            return;
+        }
+        // The grid draws every cell, so without a ceiling a large timeline
+        // would start one thread and one connection per photo at once.
+        // Cells that miss out are picked up on a later frame.
+        if self.thumb_jobs >= MAX_THUMB_JOBS {
             return;
         }
         let Some(a) = self.api_or_note() else { return };
         let Some(vault) = self.vault.clone() else { return };
         self.thumb_pending.insert(path.to_string());
         let path = path.to_string();
-        self.spawn(move || {
+        self.spawn_thumb(move || {
             let img = a.thumb(&vault, &path, 320).and_then(|d| decode_color(&d));
             Event::Thumb { path, img }
         });
@@ -756,4 +815,80 @@ fn decode_color(img: &image::DynamicImage) -> Result<egui::ColorImage, String> {
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     Ok(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `App::new` reads a config file; tests must not touch the developer's.
+    fn app() -> App {
+        std::env::set_var("QD_TEST_MODE", "1");
+        App::new()
+    }
+
+    #[test]
+    fn a_failed_thumbnail_is_not_requested_again() {
+        let mut app = app();
+        app.thumb_pending.insert("a.jpg".into());
+        app.thumb_jobs = 1;
+
+        app.tx
+            .send(Event::Thumb {
+                path: "a.jpg".into(),
+                img: Err("500 from server".into()),
+            })
+            .unwrap();
+        app.poll();
+
+        assert!(!app.thumb_pending.contains("a.jpg"), "the job is no longer in flight");
+        assert!(app.thumb_failed.contains("a.jpg"), "the failure is remembered");
+
+        // The grid asks again on the very next frame. Before the failure was
+        // remembered this re-spawned a request every frame, for ever.
+        app.request_thumb("a.jpg");
+        assert!(app.thumb_pending.is_empty(), "no second request was started");
+        assert_eq!(app.thumb_jobs, 0, "and no second thread either");
+    }
+
+    #[test]
+    fn thumbnail_requests_are_capped() {
+        let mut app = app();
+        // A signed-out app cannot spawn, so the cap is checked on its own:
+        // once the ceiling is reached, further cells are simply skipped.
+        app.thumb_jobs = MAX_THUMB_JOBS;
+        app.request_thumb("b.jpg");
+        assert!(app.thumb_pending.is_empty(), "the ceiling holds requests back");
+        assert!(app.note.is_none(), "and it does so before touching the session");
+    }
+
+    #[test]
+    fn thumbnail_jobs_do_not_disable_the_toolbar() {
+        let mut app = app();
+        app.busy = 0;
+        app.thumb_jobs = 3;
+
+        app.tx
+            .send(Event::Thumb {
+                path: "c.jpg".into(),
+                img: Err("nope".into()),
+            })
+            .unwrap();
+        app.poll();
+
+        // Thumbnails have their own counter, so `busy` — which gates every
+        // button — never goes negative or sticks above zero because of them.
+        assert_eq!(app.busy, 0);
+        assert_eq!(app.thumb_jobs, 2);
+    }
+
+    #[test]
+    fn config_round_trips_keys_it_does_not_know() {
+        // The Python desktop client keeps its token in the same file.
+        let json = r#"{"server":"http://h","username":"ada","vault":"v","token":"secret"}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.username, "ada");
+        let out = serde_json::to_string(&cfg).unwrap();
+        assert!(out.contains("\"token\":\"secret\""), "an unknown key survives a save: {out}");
+    }
 }

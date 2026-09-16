@@ -16,7 +16,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -26,18 +26,54 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use quarkdrive_core::hash::ObjectId;
-use quarkdrive_core::tree::{Kind, Snapshot};
+use quarkdrive_core::tree::{Kind, NodeRef, Snapshot};
 
 use crate::db::Db;
+use std::net::{IpAddr, SocketAddr};
+use std::time::Instant;
+use axum::extract::ConnectInfo;
 use crate::media::{self, MediaIndex, MediaRow};
 use crate::vault::{Vault, VaultStats};
 
 /// Uploads are limited by memory, not per request, so allow large files.
 const MAX_UPLOAD_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
+/// What a user may do with a vault. Owners can do everything; a share can
+/// be read-only or read-write. Computed per request so revoked shares take
+/// effect immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Owner,
+    Write,
+    Read,
+}
+
+impl Role {
+    pub fn can_write(self) -> bool {
+        self != Role::Read
+    }
+
+    fn parse(s: &str) -> Option<Role> {
+        match s {
+            "read" => Some(Role::Read),
+            "write" => Some(Role::Write),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Role::Owner => "owner",
+            Role::Write => "write",
+            Role::Read => "read",
+        }
+    }
+}
+
 pub struct AppState {
     pub data_dir: PathBuf,
     pub db: Db,
+    pub logins: LoginLimiter,
     vaults: Mutex<HashMap<String, Arc<Vault>>>,
     indexes: Mutex<HashMap<String, Arc<MediaIndex>>>,
 }
@@ -49,31 +85,40 @@ impl AppState {
         Ok(AppState {
             data_dir,
             db,
+            logins: LoginLimiter::default(),
             vaults: Mutex::new(HashMap::new()),
             indexes: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Resolve a vault by name, enforcing that the caller owns it.
-    pub fn vault(&self, name: &str, user_id: &str) -> anyhow::Result<Arc<Vault>> {
-        let mut cache = self.vaults.lock().unwrap();
-        if let Some(v) = cache.get(name) {
-            if v.row.owner_id == user_id {
-                return Ok(v.clone());
-            }
-            // Names are unique, so a different owner means "not yours".
-            return Err(anyhow::anyhow!("no such vault"));
-        }
+    /// Resolve a vault by name for a user, along with their role in it:
+    /// the owner, a sharee, or nobody (an error that does not reveal
+    /// whether the vault exists).
+    pub fn vault(&self, name: &str, user_id: &str) -> anyhow::Result<(Arc<Vault>, Role)> {
         let row = self
             .db
             .vault_by_name(name)?
             .ok_or_else(|| anyhow::anyhow!("no such vault"))?;
-        if row.owner_id != user_id {
-            return Err(anyhow::anyhow!("no such vault"));
-        }
-        let vault = Arc::new(Vault::open(&self.data_dir, row)?);
-        cache.insert(name.to_string(), vault.clone());
-        Ok(vault)
+        let role = if row.owner_id == user_id {
+            Role::Owner
+        } else {
+            match self.db.share_role(&row.id, user_id)? {
+                Some(r) => Role::parse(&r).ok_or_else(|| anyhow::anyhow!("no such vault"))?,
+                None => return Err(anyhow::anyhow!("no such vault")),
+            }
+        };
+        let vault = {
+            let mut cache = self.vaults.lock().unwrap();
+            match cache.get(name) {
+                Some(v) => v.clone(),
+                None => {
+                    let v = Arc::new(Vault::open(&self.data_dir, row.clone())?);
+                    cache.insert(name.to_string(), v.clone());
+                    v
+                }
+            }
+        };
+        Ok((vault, role))
     }
 
     pub fn index(&self, vault: &Vault) -> anyhow::Result<Arc<MediaIndex>> {
@@ -84,6 +129,60 @@ impl AppState {
         let index = Arc::new(MediaIndex::open(&vault.dir)?);
         cache.insert(vault.row.id.clone(), index.clone());
         Ok(index)
+    }
+}
+
+/// Brute-force guard for `POST /auth/login`.
+///
+/// Counters live in memory: a restart forgives everyone, which is the
+/// right bias for a self-hosted server where the alternative is locking
+/// yourself out of your own box. Keyed by (source IP, username) so one
+/// attacker guessing "ada" does not lock the real ada out from a
+/// different address.
+#[derive(Default)]
+pub struct LoginLimiter {
+    failures: Mutex<HashMap<(IpAddr, String), (u32, Instant)>>,
+}
+
+/// Five bad passwords inside ten minutes stops further attempts for the
+/// rest of that window.
+const LOGIN_MAX_FAILURES: u32 = 5;
+const LOGIN_WINDOW_SECS: u64 = 600;
+
+impl LoginLimiter {
+    fn key(ip: IpAddr, username: &str) -> (IpAddr, String) {
+        (ip, username.trim().to_lowercase())
+    }
+
+    /// May a sign-in attempt proceed right now?
+    fn allowed(&self, key: &(IpAddr, String), now: Instant) -> bool {
+        let map = self.failures.lock().unwrap();
+        match map.get(key) {
+            Some((count, since)) => {
+                *count < LOGIN_MAX_FAILURES || now.duration_since(*since).as_secs() >= LOGIN_WINDOW_SECS
+            }
+            None => true,
+        }
+    }
+
+    fn record_failure(&self, key: (IpAddr, String), now: Instant) {
+        let mut map = self.failures.lock().unwrap();
+        // Forgetting stale entries keeps the map bounded under scanning.
+        map.retain(|_, (_, since)| now.duration_since(*since).as_secs() < LOGIN_WINDOW_SECS * 2);
+        let entry = map.entry(key).or_insert((0, now));
+        // A failure after the previous window expired starts a new window,
+        // so hammering the door keeps it shut rather than counting into a
+        // counter nobody reads.
+        if entry.0 >= LOGIN_MAX_FAILURES
+            || now.duration_since(entry.1).as_secs() >= LOGIN_WINDOW_SECS
+        {
+            *entry = (0, now);
+        }
+        entry.0 += 1;
+    }
+
+    fn clear(&self, key: &(IpAddr, String)) {
+        self.failures.lock().unwrap().remove(key);
     }
 }
 
@@ -126,7 +225,14 @@ impl IntoResponse for ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
-        ApiError::new(StatusCode::BAD_REQUEST, e.to_string())
+        // A vault (or a share on one) that does not resolve must read as
+        // "not there" to callers who cannot see it, exactly like the
+        // not-found paths that answer directly.
+        if e.to_string() == "no such vault" {
+            ApiError::not_found("no such vault")
+        } else {
+            ApiError::new(StatusCode::BAD_REQUEST, e.to_string())
+        }
     }
 }
 
@@ -173,6 +279,8 @@ struct VaultView {
     name: String,
     encrypted: bool,
     created: i64,
+    /// "owner", "write" or "read" — vaults can now be shared.
+    role: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -302,13 +410,25 @@ async fn health() -> Json<serde_json::Value> {
 
 async fn login(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<LoginReq>,
 ) -> Result<Json<LoginResp>, ApiError> {
+    let key = LoginLimiter::key(addr.ip(), &req.username);
+    if !state.logins.allowed(&key, Instant::now()) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed sign-ins — wait ten minutes and try again",
+        ));
+    }
     let user_id = state
         .db
         .authenticate(&req.username, &req.password)
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "invalid username or password"))?;
+        .ok_or_else(|| {
+            state.logins.record_failure(key.clone(), Instant::now());
+            ApiError::new(StatusCode::UNAUTHORIZED, "invalid username or password")
+        })?;
+    state.logins.clear(&key);
     let token = state
         .db
         .create_token(&user_id, None)
@@ -404,14 +524,29 @@ async fn list_vaults(
         .db
         .list_vaults(&user_id)
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let vaults: Vec<VaultView> = rows
+    let mut vaults: Vec<VaultView> = rows
         .into_iter()
         .map(|v| VaultView {
             name: v.name,
             encrypted: v.encrypted,
             created: v.created,
+            role: "owner",
         })
         .collect();
+    let shared = state
+        .db
+        .list_shared_vaults(&user_id)
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    for (v, role) in shared {
+        let role = if role == "write" { "write" } else { "read" };
+        vaults.push(VaultView {
+            name: v.name,
+            encrypted: v.encrypted,
+            created: v.created,
+            role,
+        });
+    }
+    vaults.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Json(serde_json::json!({ "vaults": vaults })))
 }
 
@@ -432,7 +567,136 @@ async fn create_vault(
         name: row.name,
         encrypted: row.encrypted,
         created: row.created,
+        role: "owner",
     }))
+}
+
+// ---------------------------------------------------------------- shares
+
+#[derive(Deserialize)]
+struct ShareReq {
+    username: String,
+    role: String,
+}
+
+#[derive(Serialize)]
+struct ShareView {
+    username: String,
+    role: String,
+    created: i64,
+}
+
+/// Vault owners manage who else can reach their vault. Shares are
+/// read-only or read-write; there is deliberately no admin role.
+async fn list_shares(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vault): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if role != Role::Owner {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "only the vault's owner can manage shares",
+        ));
+    }
+    let shares: Vec<ShareView> = state
+        .db
+        .shares_for_vault(&v.row.id)
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .map(|s| ShareView {
+            username: s.username,
+            role: s.role,
+            created: s.created,
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "shares": shares })))
+}
+
+async fn create_share(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vault): Path<String>,
+    Json(req): Json<ShareReq>,
+) -> Result<Json<ShareView>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if role != Role::Owner {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "only the vault's owner can manage shares",
+        ));
+    }
+    if Role::parse(&req.role).is_none() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "role must be \"read\" or \"write\"",
+        ));
+    }
+    if v.row.encrypted {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "end-to-end encrypted vaults cannot be shared — the recipient has no key",
+        ));
+    }
+    let target = state
+        .db
+        .user_id_for_username(req.username.trim())
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no such user"))?;
+    if target == v.row.owner_id {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "that user already owns this vault",
+        ));
+    }
+    state
+        .db
+        .share_vault(&v.row.id, &target, &req.role)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let created = state
+        .db
+        .shares_for_vault(&v.row.id)
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .find(|s| s.user_id == target)
+        .map(|s| s.created)
+        .unwrap_or_default();
+    Ok(Json(ShareView {
+        username: req.username.trim().to_string(),
+        role: req.role,
+        created,
+    }))
+}
+
+async fn delete_share(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((vault, username)): Path<(String, String)>,
+) -> Result<Json<OkResp>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if role != Role::Owner {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "only the vault's owner can manage shares",
+        ));
+    }
+    let target = state
+        .db
+        .user_id_for_username(&username)
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no such user"))?;
+    if state.db.unshare_vault(&v.row.id, &target)? {
+        Ok(Json(OkResp { ok: true }))
+    } else {
+        Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "that vault is not shared with that user",
+        ))
+    }
 }
 
 // ------------------------------------------------------- object protocol
@@ -443,7 +707,7 @@ async fn get_head(
     Path(vault): Path<String>,
 ) -> Result<Json<HeadResp>, ApiError> {
     let user_id = require_user(&headers, &state)?;
-    let v = state.vault(&vault, &user_id)?;
+    let (v, _role) = state.vault(&vault, &user_id)?;
     Ok(Json(HeadResp {
         snapshot: v.head()?,
     }))
@@ -455,7 +719,7 @@ async fn get_snapshot(
     Path((vault, id)): Path<(String, String)>,
 ) -> Result<Json<Snapshot>, ApiError> {
     let user_id = require_user(&headers, &state)?;
-    let v = state.vault(&vault, &user_id)?;
+    let (v, _role) = state.vault(&vault, &user_id)?;
     let oid = ObjectId::from_hex(&id).map_err(|_| ApiError::not_found("bad object id"))?;
     v.snapshot(&oid)?
         .map(Json)
@@ -469,7 +733,7 @@ async fn have_objects(
     Json(req): Json<HaveReq>,
 ) -> Result<Json<HaveResp>, ApiError> {
     let user_id = require_user(&headers, &state)?;
-    let v = state.vault(&vault, &user_id)?;
+    let (v, _role) = state.vault(&vault, &user_id)?;
     // One query per batch rather than one per id.
     let mut out = Vec::with_capacity(req.ids.len());
     {
@@ -486,7 +750,7 @@ async fn get_object(
     Path((vault, id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let user_id = require_user(&headers, &state)?;
-    let v = state.vault(&vault, &user_id)?;
+    let (v, _role) = state.vault(&vault, &user_id)?;
     let oid = ObjectId::from_hex(&id).map_err(|_| ApiError::not_found("bad object id"))?;
     match v.get_object(&oid)? {
         Some(bytes) => Ok((
@@ -505,7 +769,13 @@ async fn put_object(
     body: Bytes,
 ) -> Result<Json<PutObjectResp>, ApiError> {
     let user_id = require_user(&headers, &state)?;
-    let v = state.vault(&vault, &user_id)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if !role.can_write() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this vault is shared with you read-only",
+        ));
+    }
     let oid = ObjectId::from_hex(&id).map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "bad object id"))?;
     // put_object verifies the content hash, so a wrong or corrupt upload is
     // rejected here rather than discovered later.
@@ -520,7 +790,13 @@ async fn commit(
     Json(req): Json<CommitReq>,
 ) -> Result<Json<CommitResp>, ApiError> {
     let user_id = require_user(&headers, &state)?;
-    let v = state.vault(&vault, &user_id)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if !role.can_write() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this vault is shared with you read-only",
+        ));
+    }
 
     // Optimistic concurrency: if the head is not where the client saw it,
     // its merge was computed against stale data.
@@ -580,7 +856,7 @@ async fn fs_list(
     Query(q): Query<PathQuery>,
 ) -> Result<Json<ListResp>, ApiError> {
     let user_id = require_user(&headers, &state)?;
-    let v = state.vault(&vault, &user_id)?;
+    let (v, _role) = state.vault(&vault, &user_id)?;
     let entries = v.list_dir(&q.path)?;
 
     let views = entry_views(&vault, entries);
@@ -596,7 +872,7 @@ async fn fs_stats(
     Path(vault): Path<String>,
 ) -> Result<Json<VaultStats>, ApiError> {
     let user_id = require_user(&headers, &state)?;
-    let v = state.vault(&vault, &user_id)?;
+    let (v, _role) = state.vault(&vault, &user_id)?;
     Ok(Json(v.stats()?))
 }
 
@@ -607,7 +883,7 @@ async fn search(
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<ListResp>, ApiError> {
     let user_id = require_user(&headers, &state)?;
-    let v = state.vault(&vault, &user_id)?;
+    let (v, _role) = state.vault(&vault, &user_id)?;
     let entries = v.search(&q.q, q.limit.unwrap_or(50).min(500))?;
     Ok(Json(ListResp {
         path: String::new(),
@@ -622,7 +898,7 @@ async fn fs_download(
     Query(q): Query<PathQuery>,
 ) -> Result<Response, ApiError> {
     let user_id = require_user(&headers, &state)?;
-    let v = state.vault(&vault, &user_id)?;
+    let (v, _role) = state.vault(&vault, &user_id)?;
     let data = v
         .read_file(&q.path)?
         .ok_or_else(|| ApiError::not_found("no such file"))?;
@@ -648,7 +924,13 @@ async fn fs_upload(
     body: Bytes,
 ) -> Result<Json<UploadResp>, ApiError> {
     let user_id = require_user(&headers, &state)?;
-    let v = state.vault(&vault, &user_id)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if !role.can_write() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this vault is shared with you read-only",
+        ));
+    }
     if q.path.trim().is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "path is required"));
     }
@@ -664,9 +946,178 @@ async fn fs_delete(
     Query(q): Query<PathQuery>,
 ) -> Result<Json<OkResp>, ApiError> {
     let user_id = require_user(&headers, &state)?;
-    let v = state.vault(&vault, &user_id)?;
-    v.remove(&q.path)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if !role.can_write() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this vault is shared with you read-only",
+        ));
+    }
+    if let Some(node_ref) = v.detach(&q.path)? {
+        let kind = match node_ref.kind {
+            Kind::File => "file",
+            Kind::Dir => "dir",
+            Kind::Symlink => "symlink",
+        };
+        state
+            .db
+            .trash_insert(
+                &v.row.id,
+                &q.path,
+                &node_ref.id.to_string(),
+                kind,
+                node_ref.size,
+            )
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
     Ok(Json(OkResp { ok: true }))
+}
+
+// ----------------------------------------------------------------- trash
+
+#[derive(Serialize)]
+struct TrashView {
+    id: String,
+    path: String,
+    name: String,
+    kind: String,
+    size: u64,
+    deleted_at: i64,
+}
+
+/// Deletions land here first. Files can be restored to their old path (or
+/// a `name.restored-<time>` sibling if that is now taken) or purged.
+/// Purging only drops the pointer — the content-addressed objects stay
+/// until object-level garbage collection exists, which also means a purge
+/// is not a secure erase.
+async fn trash_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vault): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let (v, _role) = state.vault(&vault, &user_id)?;
+    let items: Vec<TrashView> = state
+        .db
+        .trash_list(&v.row.id)
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .map(|t| TrashView {
+            name: t.path.rsplit('/').next().unwrap_or(&t.path).to_string(),
+            id: t.id,
+            path: t.path,
+            kind: t.kind,
+            size: t.size,
+            deleted_at: t.deleted_at,
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "items": items })))
+}
+
+#[derive(Deserialize)]
+struct RestoreQuery {
+    id: String,
+}
+
+async fn trash_restore(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vault): Path<String>,
+    Query(q): Query<RestoreQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if !role.can_write() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this vault is shared with you read-only",
+        ));
+    }
+    let row = state
+        .db
+        .trash_get(&v.row.id, &q.id)?
+        .ok_or_else(|| ApiError::not_found("no such trash entry"))?;
+
+    // The node id is its own content address, so the stored bytes must
+    // still be in the vault; a missing node object means real corruption,
+    // not a normal case.
+    let node_id = ObjectId::from_hex(&row.node_id)
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "corrupt trash entry"))?;
+    if !v.has_object(&node_id) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "the deleted content is no longer in the vault",
+        ));
+    }
+
+    let node_ref = NodeRef {
+        id: node_id,
+        kind: match row.kind.as_str() {
+            "dir" => Kind::Dir,
+            "symlink" => Kind::Symlink,
+            _ => Kind::File,
+        },
+        size: row.size,
+        mtime: row.deleted_at,
+    };
+
+    let mut target = row.path.clone();
+    for attempt in 0.. {
+        if v.lookup_id(&target)?.is_none() {
+            break;
+        }
+        if attempt > 5 {
+            return Err(ApiError::conflict(None));
+        }
+        let stem = row.path.rsplit('/').next().unwrap_or("item");
+        let dir = &row.path[..row.path.len() - stem.len()];
+                let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        target = format!("{dir}{stem}.restored-{secs}");
+    }
+
+    v.attach(&target, node_ref)
+        .map_err(|e| ApiError::new(StatusCode::CONFLICT, e.to_string()))?;
+    state.db.trash_remove(&v.row.id, &q.id)?;
+    Ok(Json(serde_json::json!({ "ok": true, "path": target })))
+}
+
+async fn trash_purge(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(vault): Path<String>,
+    Query(q): Query<PurgeQuery>,
+) -> Result<Json<OkResp>, ApiError> {
+    let user_id = require_user(&headers, &state)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if !role.can_write() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this vault is shared with you read-only",
+        ));
+    }
+    if q.all.unwrap_or(false) {
+        for t in state.db.trash_list(&v.row.id)? {
+            state.db.trash_remove(&v.row.id, &t.id)?;
+        }
+        return Ok(Json(OkResp { ok: true }));
+    }
+    let id = q
+        .id
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "pass ?id= or ?all=true"))?;
+    if state.db.trash_remove(&v.row.id, &id)? {
+        Ok(Json(OkResp { ok: true }))
+    } else {
+        Err(ApiError::not_found("no such trash entry"))
+    }
+}
+
+#[derive(Deserialize)]
+struct PurgeQuery {
+    id: Option<String>,
+    all: Option<bool>,
 }
 
 async fn fs_mkdir(
@@ -676,7 +1127,13 @@ async fn fs_mkdir(
     Query(q): Query<PathQuery>,
 ) -> Result<Json<OkResp>, ApiError> {
     let user_id = require_user(&headers, &state)?;
-    let v = state.vault(&vault, &user_id)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if !role.can_write() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this vault is shared with you read-only",
+        ));
+    }
     v.mkdir(&q.path)?;
     Ok(Json(OkResp { ok: true }))
 }
@@ -689,7 +1146,13 @@ async fn fs_move(
     Query(q): Query<MoveQuery>,
 ) -> Result<Json<OkResp>, ApiError> {
     let user_id = require_user(&headers, &state)?;
-    let v = state.vault(&vault, &user_id)?;
+    let (v, role) = state.vault(&vault, &user_id)?;
+    if !role.can_write() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this vault is shared with you read-only",
+        ));
+    }
     if q.from.trim().is_empty() || q.to.trim().is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "from and to are required"));
     }
@@ -704,7 +1167,7 @@ async fn fs_thumb(
     Query(q): Query<ThumbQuery>,
 ) -> Result<Response, ApiError> {
     let user_id = require_user(&headers, &state)?;
-    let v = state.vault(&vault, &user_id)?;
+    let (v, _role) = state.vault(&vault, &user_id)?;
     v.require_readable()?;
 
     let (node_id, node) = v
@@ -731,7 +1194,7 @@ async fn timeline(
     Query(q): Query<TimelineQuery>,
 ) -> Result<Json<TimelineResp>, ApiError> {
     let user_id = require_user(&headers, &state)?;
-    let v = state.vault(&vault, &user_id)?;
+    let (v, _role) = state.vault(&vault, &user_id)?;
     v.require_readable()?;
     let index = state.index(&v)?;
 
@@ -843,6 +1306,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/auth/status", get(auth_status))
         .route("/api/v1/whoami", get(whoami))
         .route("/api/v1/vaults", get(list_vaults).post(create_vault))
+        .route(
+            "/api/v1/vaults/:vault/shares",
+            get(list_shares).post(create_share),
+        )
+        .route("/api/v1/vaults/:vault/shares/:username", delete(delete_share))
+        .route(
+            "/api/v1/vaults/:vault/trash",
+            get(trash_list).delete(trash_purge),
+        )
+        .route("/api/v1/vaults/:vault/trash/restore", post(trash_restore))
         // Object protocol used by the desktop and Android sync engine.
         .route("/api/v1/vaults/:vault/head", get(get_head))
         .route("/api/v1/vaults/:vault/snapshots/:id", get(get_snapshot))
@@ -892,6 +1365,11 @@ impl ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn lockout_key(user: &str) -> (IpAddr, String) {
+        (IpAddr::V4(Ipv4Addr::LOCALHOST), user.to_string())
+    }
 
     #[test]
     fn urlencode_leaves_safe_characters_alone() {
@@ -903,5 +1381,41 @@ mod tests {
     fn filenames_are_sanitized_for_headers() {
         assert_eq!(sanitize_filename("a\"b\\c\nd"), "abcd");
         assert_eq!(sanitize_filename("normal.jpg"), "normal.jpg");
+    }
+
+    #[test]
+    fn five_failures_lock_the_door_for_the_window() {
+        let limiter = LoginLimiter::default();
+        let k = lockout_key("ada");
+        let t0 = Instant::now();
+        for _ in 0..LOGIN_MAX_FAILURES {
+            assert!(limiter.allowed(&k, t0));
+            limiter.record_failure(k.clone(), t0);
+        }
+        assert!(!limiter.allowed(&k, t0), "locked after {LOGIN_MAX_FAILURES} failures");
+        // A different user from the same address is unaffected.
+        assert!(limiter.allowed(&lockout_key("bob"), t0));
+        // So is the same user from a different address.
+        let elsewhere = (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), "ada".into());
+        assert!(limiter.allowed(&elsewhere, t0));
+        // The lock expires with the window.
+        let later = t0 + std::time::Duration::from_secs(LOGIN_WINDOW_SECS + 1);
+        assert!(limiter.allowed(&k, later));
+    }
+
+    #[test]
+    fn a_successful_sign_in_forgets_the_failures() {
+        let limiter = LoginLimiter::default();
+        let k = lockout_key("ada");
+        let t0 = Instant::now();
+        for _ in 0..LOGIN_MAX_FAILURES - 1 {
+            limiter.record_failure(k.clone(), t0);
+        }
+        limiter.clear(&k);
+        for _ in 0..LOGIN_MAX_FAILURES {
+            assert!(limiter.allowed(&k, t0));
+            limiter.record_failure(k.clone(), t0);
+        }
+        assert!(!limiter.allowed(&k, t0));
     }
 }
