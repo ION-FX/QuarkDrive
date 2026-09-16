@@ -1710,11 +1710,16 @@ struct TrashView {
     deleted_at: i64,
 }
 
+/// How many historical snapshots GC keeps. Version history is real but
+/// bounded: older states age out, which is also what lets a purge
+/// eventually erase content the history once referenced.
+const GC_HISTORY: usize = 10;
+
 /// Deletions land here first. Files can be restored to their old path (or
 /// a `name.restored-<time>` sibling if that is now taken) or purged.
-/// Purging only drops the pointer — the content-addressed objects stay
-/// until object-level garbage collection exists, which also means a purge
-/// is not a secure erase.
+/// Purging drops the pointer and then collects: chunks the purged content
+/// no longer shares with any live file, retained snapshot or other trash
+/// entry are deleted from the object store.
 async fn trash_list(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1814,7 +1819,7 @@ async fn trash_purge(
     headers: HeaderMap,
     Path(vault): Path<String>,
     Query(q): Query<PurgeQuery>,
-) -> Result<Json<OkResp>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let user_id = require_user(&headers, &state)?;
     let (v, role) = state.vault(&vault, &user_id)?;
     if !role.can_write() {
@@ -1823,20 +1828,37 @@ async fn trash_purge(
             "this vault is shared with you read-only",
         ));
     }
-    if q.all.unwrap_or(false) {
-        for t in state.db.trash_list(&v.row.id)? {
-            state.db.trash_remove(&v.row.id, &t.id)?;
-        }
-        return Ok(Json(OkResp { ok: true }));
-    }
-    let id = q
-        .id
-        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "pass ?id= or ?all=true"))?;
-    if state.db.trash_remove(&v.row.id, &id)? {
-        Ok(Json(OkResp { ok: true }))
+    let removed: Vec<String> = if q.all.unwrap_or(false) {
+        state
+            .db
+            .trash_list(&v.row.id)?
+            .into_iter()
+            .map(|t| t.id)
+            .collect()
     } else {
-        Err(ApiError::not_found("no such trash entry"))
+        vec![q
+            .id
+            .clone()
+            .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "pass ?id= or ?all=true"))?]
+    };
+
+    for id in &removed {
+        if !state.db.trash_remove(&v.row.id, id)? && !q.all.unwrap_or(false) {
+            return Err(ApiError::not_found("no such trash entry"));
+        }
     }
+
+    // Whatever the remaining trash still pins is kept; everything else the
+    // purged entries uniquely held is erased.
+    let keep: Vec<ObjectId> = state
+        .db
+        .trash_list(&v.row.id)?
+        .iter()
+        .filter_map(|t| ObjectId::from_hex(&t.node_id).ok())
+        .collect();
+    let freed = v.gc(&keep, GC_HISTORY).unwrap_or(0);
+
+    Ok(Json(serde_json::json!({ "ok": true, "freed": freed })))
 }
 
 #[derive(Deserialize)]

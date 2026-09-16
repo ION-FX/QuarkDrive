@@ -458,6 +458,75 @@ expect "$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" \
   "404" "the cancelled session is gone"
 expect "$(ls "$DATA/uploads" 2>/dev/null | wc -l)" "0" "no leftover part files"
 
+echo "== garbage collection: purge is a real erase =="
+head -c 200000 /dev/urandom > "$WORK/gc-unique.bin"
+curl -sf -X PUT "${auth[@]}" --data-binary @"$WORK/gc-unique.bin" \
+     "$SRV/api/v1/vaults/photos/fs?path=gc/gcfile.bin" >/dev/null
+head -c 100000 /dev/urandom > "$WORK/gc-v2.bin"
+curl -sf -X PUT "${auth[@]}" --data-binary @"$WORK/gc-v2.bin" \
+     "$SRV/api/v1/vaults/photos/fs?path=gc/gcfile.bin" >/dev/null
+
+V1_ID=$(curl -s "${auth[@]}" "$SRV/api/v1/vaults/photos/fs/versions?path=gc/gcfile.bin" | python3 -c "
+import json,sys; items=json.load(sys.stdin)['items']; print(items[-1]['id'])")
+expect "$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" \
+  "$SRV/api/v1/vaults/photos/fs/versions/download?path=gc/gcfile.bin&id=$V1_ID")" \
+  "200" "an old version is readable before purge"
+
+# Delete to trash, then purge: the trash reference drops.
+curl -sf -X DELETE "${auth[@]}" "$SRV/api/v1/vaults/photos/fs?path=gc/gcfile.bin" >/dev/null
+PURGED=$(curl -s -X DELETE "${auth[@]}" "$SRV/api/v1/vaults/photos/trash?all=true")
+case "$PURGED" in
+  *'"freed"'*) pass "purge reports how many objects it erased";;
+  *) fail "purge response missing freed count: $PURGED";;
+esac
+
+# Age the retained history past the purged content, then collect again.
+for i in $(seq 1 12); do
+  head -c 5000 /dev/urandom > "$WORK/gc-noise.bin"
+  curl -sf -X PUT "${auth[@]}" --data-binary @"$WORK/gc-noise.bin" \
+       "$SRV/api/v1/vaults/photos/fs?path=gc/noise-$i.bin" >/dev/null
+done
+curl -sf -X DELETE "${auth[@]}" "$SRV/api/v1/vaults/photos/trash?all=true" >/dev/null
+
+IN_VERSIONS=$(curl -s "${auth[@]}" "$SRV/api/v1/vaults/photos/fs/versions?path=gc/gcfile.bin" | \
+  grep -c "$V1_ID" || true)
+expect "$IN_VERSIONS" "0" "the purged version ages out of version history"
+expect "$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" \
+  "$SRV/api/v1/vaults/photos/fs/versions/download?path=gc/gcfile.bin&id=$V1_ID")" \
+  "404" "the purged version's bytes are gone from the server"
+
+# Sharing is respected: a chunk still used by a live file must survive.
+head -c 300000 /dev/urandom > "$WORK/shared-content.bin"
+curl -sf -X PUT "${auth[@]}" --data-binary @"$WORK/shared-content.bin" \
+     "$SRV/api/v1/vaults/photos/fs?path=gc/twin-a.bin" >/dev/null
+curl -sf -X PUT "${auth[@]}" --data-binary @"$WORK/shared-content.bin" \
+     "$SRV/api/v1/vaults/photos/fs?path=gc/twin-b.bin" >/dev/null
+curl -sf -X DELETE "${auth[@]}" "$SRV/api/v1/vaults/photos/fs?path=gc/twin-a.bin" >/dev/null
+curl -sf -X DELETE "${auth[@]}" "$SRV/api/v1/vaults/photos/trash?all=true" >/dev/null
+for i in $(seq 1 12); do
+  head -c 5000 /dev/urandom > "$WORK/gc-noise2.bin"
+  curl -sf -X PUT "${auth[@]}" --data-binary @"$WORK/gc-noise2.bin" \
+       "$SRV/api/v1/vaults/photos/fs?path=gc/n2-$i.bin" >/dev/null
+done
+curl -sf -X DELETE "${auth[@]}" "$SRV/api/v1/vaults/photos/trash?all=true" >/dev/null
+curl -s "${auth[@]}" "$SRV/api/v1/vaults/photos/fs/download?path=gc/twin-b.bin" > "$WORK/twin-down.bin"
+if cmp -s "$WORK/shared-content.bin" "$WORK/twin-down.bin"; then
+  pass "a shared chunk survives its twin's purge"
+else
+  fail "gc deleted a chunk a live file still uses"
+fi
+# Restore-after-no-purge still works: delete, keep in trash, restore.
+curl -sf -X PUT "${auth[@]}" --data-binary 'restorable' \
+     "$SRV/api/v1/vaults/photos/fs?path=gc/keep.txt" >/dev/null
+curl -sf -X DELETE "${auth[@]}" "$SRV/api/v1/vaults/photos/fs?path=gc/keep.txt" >/dev/null
+KEEP_ID=$(curl -s "${auth[@]}" "$SRV/api/v1/vaults/photos/trash" | python3 -c "
+import json,sys
+items=[i for i in json.load(sys.stdin)['items'] if i['path']=='gc/keep.txt']
+print(items[0]['id'] if items else '')")
+curl -sf -X POST "${auth[@]}" "$SRV/api/v1/vaults/photos/trash/restore?id=$KEEP_ID" >/dev/null
+expect "$(curl -s "${auth[@]}" "$SRV/api/v1/vaults/photos/fs/download?path=gc/keep.txt")" \
+  "restorable" "trash without purge still restores"
+
 echo "== login rate limiting =="
 for i in 1 2 3 4 5 6; do
   code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$SRV/api/v1/auth/login" \

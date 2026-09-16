@@ -1245,8 +1245,9 @@ async function restoreFromTrash(id) {
 async function purgeTrashItem(item) {
   if (!window.confirm(`Delete forever ${item.path}? This cannot be undone.`)) return;
   try {
-    await api(vaultApi(`/trash?id=${encodeURIComponent(item.id)}`), { method: 'DELETE' });
-    toast(`Purged ${item.path}`, 'ok');
+    const res = await api(vaultApi(`/trash?id=${encodeURIComponent(item.id)}`), { method: 'DELETE' });
+    const data = await res.json();
+    toast(purgeMessage(item.path, data), 'ok');
   } catch (e) {
     toast(`Purge failed: ${e.message}`, 'error');
     return;
@@ -1257,13 +1258,20 @@ async function purgeTrashItem(item) {
 async function emptyTrash() {
   if (!window.confirm('Delete forever everything in the trash? This cannot be undone.')) return;
   try {
-    await api(vaultApi('/trash?all=true'), { method: 'DELETE' });
-    toast('Trash emptied', 'ok');
+    const res = await api(vaultApi('/trash?all=true'), { method: 'DELETE' });
+    const data = await res.json();
+    toast(purgeMessage('The trash', data), 'ok');
   } catch (e) {
     toast(`Emptying the trash failed: ${e.message}`, 'error');
     return;
   }
   await loadTrash().catch(() => {});
+}
+
+function purgeMessage(what, data) {
+  return data && data.freed > 0
+    ? `${what} purged — ${data.freed} stored object${data.freed === 1 ? '' : 's'} erased`
+    : `${what} purged`;
 }
 
 /* ------------------------------------------------------------ sharing */

@@ -112,10 +112,16 @@ end-to-end encrypted vaults — the recipient would have no key.
 
 Deleted files are not destroyed. The web UI (and the API) moves them to a
 per-vault trash: restore puts a file back at its old path — or next to it as
-`name.restored-<time>` if that path is taken again — and purging drops the
-pointer. Because storage is content-addressed, a restore never copies
-anything. One honest limit: purging is not a secure erase; the chunks stay
-on disk until object-level garbage collection exists.
+`name.restored-<time>` if that path is taken again — and purging now runs a
+real garbage collection pass: content the purged file uniquely held is
+erased from the object store, while chunks a live file still shares are
+kept (that is deduplication doing its job). Because storage is
+content-addressed, a restore never copies anything.
+
+Version history has bounded retention — the last ten snapshots — so old
+states age out, which is what lets a purge eventually erase content the
+history once referenced. Purged bytes disappear from version history the
+same way.
 
 ## Two-factor sign-in
 

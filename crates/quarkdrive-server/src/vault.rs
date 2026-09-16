@@ -15,6 +15,7 @@
 //! no key, so every file operation is refused rather than silently corrupted.
 
 use anyhow::{anyhow, Result};
+use std::collections::HashSet;
 use quarkdrive_core::chunker::chunk_reader;
 use quarkdrive_core::hash::ObjectId;
 use quarkdrive_core::object::ObjectStore;
@@ -427,9 +428,10 @@ impl Vault {
                 break;
             }
             steps += 1;
-            let snap = self
-                .snapshot(&snap_id)?
-                .ok_or_else(|| anyhow!("missing snapshot in history"))?;
+            // History is bounded: a pruned ancestor ends the walk.
+            let Some(snap) = self.snapshot(&snap_id)? else {
+                break;
+            };
             cursor = snap.parent;
             if let Some((node_id, node)) = self.lookup_id_at(&snap.root, path)? {
                 if node.kind() == Kind::File && seen.insert(node_id) {
@@ -465,6 +467,76 @@ impl Vault {
             self.put_file(path, bytes, None)?;
         }
         Ok(data)
+    }
+
+    /// Mark a node and everything it references (child nodes, file chunks).
+    fn mark_node_refs(&self, id: &ObjectId, live: &mut HashSet<ObjectId>) -> Result<()> {
+        if !live.insert(*id) {
+            return Ok(());
+        }
+        if let Some(node) = self.trees().get_node(id)? {
+            match &node {
+                Node::File { chunks, .. } => {
+                    for c in chunks {
+                        live.insert(c.id);
+                    }
+                }
+                Node::Dir { entries } => {
+                    for r in entries.values() {
+                        self.mark_node_refs(&r.id, live)?;
+                    }
+                }
+                Node::Symlink { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete every object that nothing alive points at any more.
+    ///
+    /// What counts as alive:
+    ///  * the head snapshot and its whole tree — the files that exist now;
+    ///  * the newest `history` snapshots behind it — version history has
+    ///    bounded retention, so old states age out instead of pinning
+    ///    purged content forever;
+    ///  * every id in `keep_roots` — a trash entry's detached node, which
+    ///    is why deleted-but-not-purged files always restore.
+    ///
+    /// Returns how many objects were deleted. `qd` clients are expected to
+    /// push objects before committing, so this is safe to run at any time;
+    /// a client mid-push simply retries its commit.
+    pub fn gc(&self, keep_roots: &[ObjectId], history: usize) -> Result<usize> {
+        let mut live: HashSet<ObjectId> = HashSet::new();
+
+        let mut cursor = self.head()?;
+        let mut kept = 0usize;
+        while let Some(snap_id) = cursor {
+            if !live.insert(snap_id) {
+                break; // cycle guard; the chain is a chain, but be defensive
+            }
+            // A previous gc may have pruned this ancestor: that is the
+            // beginning of history as far as anyone can now see.
+            let Some(snap) = self.snapshot(&snap_id)? else {
+                break;
+            };
+            cursor = snap.parent;
+            self.mark_node_refs(&snap.root, &mut live)?;
+            kept += 1;
+            if kept >= history.max(1) {
+                break;
+            }
+        }
+        for root in keep_roots {
+            self.mark_node_refs(root, &mut live)?;
+        }
+
+        let mut freed = 0;
+        for id in self.objects.ids()? {
+            if !live.contains(&id) && self.objects.delete(&id)? {
+                freed += 1;
+            }
+        }
+        Ok(freed)
     }
 
     /// What is in this vault, and when it was last touched.
@@ -708,6 +780,69 @@ mod tests {
     }
 
     #[test]
+    fn gc_frees_purged_content_and_honors_trash() {
+        let (_d, v) = vault("v-gc", false);
+        let unique: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+        v.put_file("secret.bin", &unique, None).unwrap();
+
+        // Deleted-but-not-purged: the trash root pins every byte.
+        let node_ref = v.detach("secret.bin").unwrap().unwrap();
+        assert_eq!(v.gc(&[node_ref.id], 10).unwrap(), 0);
+        assert!(v.read_node_bytes(&node_ref.id).unwrap().is_some());
+
+        // Purged: the trash reference is gone. The content survives only
+        // while it is inside the retained history window, so push the
+        // chain past it.
+        let mut pad = 1u8;
+        for _ in 0..14 {
+            pad = pad.wrapping_add(11);
+            v.put_file("noise.bin", &[pad; 4096], None).unwrap();
+        }
+        let freed = v.gc(&[], 10).unwrap();
+        assert!(freed >= 2, "at least the node and its chunk should free, got {freed}");
+        assert!(
+            v.read_node_bytes(&node_ref.id).unwrap().is_none(),
+            "purged content must be unrecoverable"
+        );
+        // What is alive stays alive.
+        assert!(v.read_file("noise.bin").unwrap().is_some());
+
+        // Deduplication is respected: a chunk another file still uses is
+        // never collected.
+        v.put_file("twin-a", b"shared bytes", None).unwrap();
+        v.put_file("twin-b", b"shared bytes", None).unwrap();
+        let (twin_id, _) = v.lookup_id("twin-a").unwrap().unwrap();
+        v.detach("twin-a").unwrap();
+        for i in 0..3u8 {
+            v.put_file("noise.bin", &[i; 4096], None).unwrap();
+        }
+        v.gc(&[], 10).unwrap();
+        assert_eq!(
+            v.read_file("twin-b").unwrap().as_deref(),
+            Some(b"shared bytes".as_slice()),
+            "a shared chunk must survive a twin's deletion"
+        );
+        let _ = twin_id;
+    }
+
+    #[test]
+    fn gc_never_breaks_the_head() {
+        let (_d, v) = vault("v-gc-head", false);
+        for i in 0..20u8 {
+            v.put_file("f.bin", &[i; 3000], None).unwrap();
+        }
+        // With the whole history retained the only orphan is the empty
+        // root materialised for the very first commit — a pre-existing
+        // leftover GC now cleans up.
+        assert_eq!(v.gc(&[], 100).unwrap(), 1);
+        assert!(v.read_file("f.bin").unwrap().is_some());
+        // Tightening retention frees old versions but the head survives.
+        let pruned = v.gc(&[], 5).unwrap();
+        assert!(pruned > 0, "old versions age out of a tightened window");
+        assert!(v.read_file("f.bin").unwrap().is_some());
+    }
+
+    #[test]
     fn overwrites_build_a_version_history() {
         let (_d, v) = vault("v-versions", false);
         v.put_file("report.txt", b"first draft", None).unwrap();
@@ -777,9 +912,12 @@ mod tests {
     fn uploaded_content_is_deduplicated() {
         let (_d, v) = vault("v-dedup", false);
         let body = pseudo_random(7, 400 * 1024);
-        v.put_file("one.bin", &body, None).unwrap();
+        // Explicit mtimes: a node's hash covers its mtime, so wall-clock
+        // seconds crossing between the two puts would defeat the dedup and
+        // make this test flaky rather than the dedup wrong.
+        v.put_file("one.bin", &body, Some(1000)).unwrap();
         let after_one = v.objects.ids().unwrap().len();
-        v.put_file("two.bin", &body, None).unwrap();
+        v.put_file("two.bin", &body, Some(1000)).unwrap();
         let after_two = v.objects.ids().unwrap().len();
 
         // Only the second file's node should be new; its chunks are shared.
